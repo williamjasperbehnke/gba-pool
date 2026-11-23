@@ -388,8 +388,8 @@ def make_panel(paused=False):
     image = indexed((256, 256), colors)
     draw = ImageDraw.Draw(image)
     if paused:
-        draw.rounded_rectangle((50, 36, 192, 126), 7, fill=1)
-        draw.rounded_rectangle((48, 33, 191, 123), 6, fill=4, outline=2)
+        draw.rounded_rectangle((50, 36, 192, 144), 7, fill=1)
+        draw.rounded_rectangle((48, 33, 191, 141), 6, fill=4, outline=2)
         draw.rounded_rectangle((62, 59, 177, 77), 4, fill=7, outline=6)
         draw.rounded_rectangle((62, 83, 177, 101), 4, fill=5, outline=2)
     else:
@@ -449,6 +449,23 @@ def make_sprites():
         active.paste(border.crop((0, 0, 45, 32)), (0, mode * 64))
         active.paste(border.crop((45, 0, 89, 32)), (0, mode * 64 + 32))
     save(active, "active_player", "sprite", height=32, bpp_mode="bpp_4")
+
+    spin_ball = indexed((16, 16), INK)
+    draw = ImageDraw.Draw(spin_ball)
+    for y in range(1, 15):
+        for x in range(1, 15):
+            dx, dy = (x - 7.5) / 7, (y - 7.5) / 7
+            depth = 1 - dx * dx - dy * dy
+            if depth >= 0:
+                light = math.sqrt(depth) - .22 * dx - .27 * dy
+                draw.point((x, y), fill=4 + int(light > .23) + int(light > .56))
+    save(spin_ball, "spin_ball", "sprite", bpp_mode="bpp_4")
+
+    spin_dot = indexed((8, 8), INK)
+    draw = ImageDraw.Draw(spin_dot)
+    draw.rectangle((3, 3, 4, 4), fill=10)
+    draw.point((3, 3), fill=11)
+    save(spin_dot, "spin_dot", "sprite", bpp_mode="bpp_4")
 
     stick = indexed((64, 32), CUE)
     draw = ImageDraw.Draw(stick)

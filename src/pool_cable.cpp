@@ -13,14 +13,14 @@ constexpr int value_mask = 1023;
 constexpr int turn_mask = 7;
 constexpr int ack_tag = 6;
 constexpr int control_tag = 7;
-constexpr int hello = 0x264;
-constexpr int join = 0x265;
-constexpr int goodbye = 0x266;
-constexpr int heartbeat = 0x267;
+constexpr int hello = 0x274;
+constexpr int join = 0x275;
+constexpr int goodbye = 0x276;
+constexpr int heartbeat = 0x277;
 
-int checksum(int turn, int angle, int speed, int x, int y, int pocket)
+int checksum(int turn, int angle, int speed, int x, int y, int shot_options)
 {
-    return (turn * 31 + angle * 17 + speed * 23 + x * 41 + y * 61 + pocket * 73 + 0x1d5) & value_mask;
+    return (turn * 31 + angle * 17 + speed * 23 + x * 41 + y * 61 + shot_options * 73 + 0x1d5) & value_mask;
 }
 }
 
@@ -89,7 +89,8 @@ bool CableMatch::receive_shot(CableShot& shot) const
     {
         return false;
     }
-    shot = { incoming[0], incoming[1], incoming[2], incoming[3], incoming[4] - 1 };
+    shot = { incoming[0], incoming[1], incoming[2], incoming[3], (incoming[4] & 7) - 1,
+             decode_spin(unsigned(incoming[4]) >> 3) };
     return true;
 }
 
@@ -162,9 +163,9 @@ int CableMatch::write_word()
         }
         if(sending_shot)
         {
-            int pocket = outgoing.pocket + 1;
-            int words[] = { outgoing.angle, outgoing.speed, outgoing.x, outgoing.y, pocket,
-                            checksum(sending_turn, outgoing.angle, outgoing.speed, outgoing.x, outgoing.y, pocket) };
+            int options = (encode_spin(outgoing.spin) << 3) | (outgoing.pocket + 1);
+            int words[] = { outgoing.angle, outgoing.speed, outgoing.x, outgoing.y, options,
+                            checksum(sending_turn, outgoing.angle, outgoing.speed, outgoing.x, outgoing.y, options) };
             int tag = next_fragment;
             next_fragment = (next_fragment + 1) % 6;
             return (tag << tag_shift) | ((sending_turn & turn_mask) << turn_shift) | words[tag];

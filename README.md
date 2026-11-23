@@ -1,15 +1,15 @@
 # Break Room
 
-Break Room is an 8-ball game with ranked solo play and two-player Link Cable matches for Game Boy Advance, written in C++ with Butano. Press Select during a match to switch between the camera behind the cue ball and the overhead view. The selected view stays active through shots and pocket calls and resumes after ball in hand. The close camera frames the far rail and holds position as a shot plays out. Ball textures rotate with their movement. Open [break_room.gba](break_room.gba) in mGBA or load it on a GBA flashcart with SRAM support.
+Break Room is an 8-ball game with ranked solo play and two-player Link Cable matches for Game Boy Advance, written in C++ with Butano. Press Select during a match to switch between the camera behind the cue ball and the overhead view. The close camera holds through shots and opponent turns, then eases into position for your next shot. Ball textures rotate with their movement. Open [break_room.gba](break_room.gba) in mGBA or load it on a GBA flashcart with SRAM support.
 
 ## Controls
 
 | GBA button | Action |
 | --- | --- |
-| Left / Right | Tap to nudge the aim by about a third of a degree. Hold to sweep across the table. |
-| L / R | Fine aim with unaccelerated repeat. |
-| L + R together | Switch between the full and compact HUDs. The compact HUD keeps the ball rows and power meter visible. |
-| Up / Down while aiming | Cycle available pocket lines and set their suggested power. |
+| L / R | Aim left or right. Tap to nudge by about a third of a degree or hold to sweep. |
+| D-pad while aiming | Move the red contact dot on the cue-ball preview in the bottom-right corner. Left and Right add sidespin, Up adds follow, and Down adds draw. Tap in the opposite direction to return toward center. |
+| Up / Down while paused | Switch between the full and compact HUDs. The compact HUD keeps the ball rows and power meter visible. |
+| L / R while paused | Cycle available pocket lines and set their suggested power. |
 | Hold A, then release | Charge and shoot. Aim adjustments still work while holding A. With the HUD visible, the meter fills while you hold A. A tap uses the starting or suggested power. |
 | B | Cancel while charging. While aiming, change the called 8-ball pocket or reset power on other shots. |
 | D-pad, then A | Move and place the cue ball when you have ball in hand. |

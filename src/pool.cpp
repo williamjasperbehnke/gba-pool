@@ -204,10 +204,11 @@ void Table::rack()
     shot = {};
 }
 
-void Table::strike(Vec heading, int speed, int called_pocket)
+void Table::strike(Vec heading, int speed, int called_pocket, CueSpin spin)
 {
     shot = {};
     shot.called_pocket = int8_t(called_pocket);
+    shot.cue_spin = encode_spin(spin);
     balls[0].velocity = travel(heading, speed * velocity_scale);
 }
 
@@ -240,17 +241,34 @@ void Table::cushion_or_pocket(int id)
         }
     }
 
-    if(ball.pos.x < left || ball.pos.x > right)
+    bool hit_x = ball.pos.x < left || ball.pos.x > right;
+    bool hit_y = ball.pos.y < top || ball.pos.y > bottom;
+    Vec incoming = ball.velocity;
+    if(hit_x)
     {
         ball.pos.x = std::clamp(ball.pos.x, left, right);
         ball.velocity.x = -ball.velocity.x * 218 / 256;
         shot.rail_after_contact |= shot.first >= 0;
     }
-    if(ball.pos.y < top || ball.pos.y > bottom)
+    if(hit_y)
     {
         ball.pos.y = std::clamp(ball.pos.y, top, bottom);
         ball.velocity.y = -ball.velocity.y * 218 / 256;
         shot.rail_after_contact |= shot.first >= 0;
+    }
+    if(id == 0 && (hit_x || hit_y) && shot.cue_spin != encode_spin({}))
+    {
+        CueSpin spin = decode_spin(shot.cue_spin);
+        if(hit_x && ! hit_y)
+        {
+            ball.velocity.y += incoming.x * spin.side / 24;
+        }
+        if(hit_y && ! hit_x)
+        {
+            ball.velocity.x -= incoming.y * spin.side / 24;
+        }
+        spin.side -= (spin.side > 0) - (spin.side < 0);
+        shot.cue_spin = encode_spin(spin);
     }
 }
 
@@ -293,11 +311,21 @@ void Table::collide(int a, int b)
     {
         impact = std::max(impact, closing / velocity_scale);
         Vec impulse = travel(axis, closing * 248 / 256);
+        Vec incoming = first.velocity;
         first.velocity = first.velocity - impulse;
         second.velocity += impulse;
         if(a == 0 && shot.first < 0)
         {
             shot.first = b;
+            CueSpin spin = decode_spin(shot.cue_spin);
+            if(spin.vertical && (incoming.x || incoming.y))
+            {
+                // Follow and draw act along the cue ball's approach after contact.
+                Vec heading = normalized({ incoming.x / velocity_scale, incoming.y / velocity_scale });
+                first.velocity += travel(heading, closing * spin.vertical / 11);
+                spin.vertical = 0;
+                shot.cue_spin = encode_spin(spin);
+            }
         }
     }
 }

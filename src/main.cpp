@@ -12,6 +12,7 @@
 #include "bn_sound_items.h"
 #include "bn_sprite_font.h"
 #include "bn_sprite_ptr.h"
+#include "bn_sprite_palette_ptr.h"
 #include "bn_sprite_affine_mat_ptr.h"
 #include "bn_sprite_tiles_ptr.h"
 #include "bn_tile.h"
@@ -50,6 +51,8 @@
 #include "bn_sprite_items_hud_font.h"
 #include "bn_sprite_items_marks.h"
 #include "bn_sprite_items_meter.h"
+#include "bn_sprite_items_spin_ball.h"
+#include "bn_sprite_items_spin_dot.h"
 #include "bn_sprite_items_active_player.h"
 #include "bn_sprite_items_called_pockets.h"
 
@@ -76,16 +79,20 @@ constexpr const bn::sprite_item* ball_items[] = {
 
 enum class CueBallTint { ivory, red, bright_red };
 
-constexpr auto placement_flash_colors = [] {
+constexpr auto placement_colors(bool bright)
+{
     bn::array<bn::color, 16> colors{};
-    colors[8] = bn::color(11, 2, 3);
-    colors[9] = bn::color(18, 3, 5);
-    colors[10] = bn::color(25, 5, 7);
-    colors[11] = bn::color(31, 10, 11);
-    colors[12] = bn::color(31, 21, 19);
+    for(int shade = 0; shade < 5; ++shade)
+    {
+        colors[8 + shade] = bright ? bn::color(27 + shade, 6 + 2 * shade, 7 + shade) :
+                                     bn::color(13 + 2 * shade, 1 + shade, 2 + shade);
+    }
     return colors;
-}();
+}
+constexpr auto placement_flash_colors = placement_colors(true);
+constexpr auto placement_red_colors = placement_colors(false);
 constexpr bn::sprite_palette_item placement_flash_palette(placement_flash_colors, bn::bpp_mode::BPP_4);
+constexpr bn::sprite_palette_item placement_red_palette(placement_red_colors, bn::bpp_mode::BPP_4);
 
 constexpr bn::sprite_font hud_font(bn::sprite_items::hud_font, {}, font_widths, 2);
 constexpr auto text_colors(bn::color ink)
@@ -199,7 +206,7 @@ const char* foul_label(Notice notice)
     }
 }
 
-int aim_step(int held_frames, bool fine)
+int aim_step(int held_frames)
 {
     if(held_frames == 0)
     {
@@ -209,15 +216,13 @@ int aim_step(int held_frames, bool fine)
     {
         return 0;
     }
-    if(fine)
-    {
-        return (held_frames - 9) % 3 == 0 ? 1 : 0;
-    }
-    if(held_frames < 20)
-    {
-        return held_frames & 1;
-    }
-    return std::min(6, 2 + (held_frames - 20) / 7);
+    return std::min(4, 1 + (held_frames - 9) / 11);
+}
+
+constexpr int angle_delta(int target, int current)
+{
+    constexpr int half_turn = angle_count / 2;
+    return ((target - current + half_turn) & (angle_count - 1)) - half_turn;
 }
 
 BN_DATA_EWRAM_BSS bn::tile sphere_tiles[16][sphere_words / 8];
@@ -282,6 +287,8 @@ public:
         {
             edge.set_bg_priority(0);
         }
+        spin_ball.set_bg_priority(0);
+        spin_dot.set_bg_priority(0);
         called.set_bg_priority(3);
         for(int i = 0; i < 8; ++i)
         {
@@ -388,10 +395,10 @@ public:
         open_panel();
         label(panel_text, 120, 34, "HOW TO PLAY", gold_text);
         constexpr const char* buttons[] = {
-            "LEFT / RIGHT", "L / R", "L + R", "UP / DOWN", "SELECT", "HOLD A", "B", "D-PAD / A"
+            "L / R", "D-PAD", "PAUSE / UP", "PAUSE / L / R", "SELECT", "HOLD A", "B", "D-PAD / A"
         };
         constexpr const char* actions[] = {
-            "AIM", "FINE AIM", "CHANGE HUD SIZE", "CYCLE POCKET LINES", "SWITCH CAMERAS",
+            "AIM", "SET SPIN", "CHANGE HUD SIZE", "CYCLE POCKET LINES", "SWITCH CAMERAS",
             "RELEASE TO SHOOT", "CANCEL / RECALL 8", "MOVE / PLACE CUE"
         };
         for(int row = 0; row < 8; ++row)
@@ -402,13 +409,19 @@ public:
         label(panel_text, 120, 130, "A / B  BACK", gold_text);
     }
 
-    void pause(bool linked)
+    void pause(bool linked, bool full_hud_enabled, int lines, int selected)
     {
         open_panel(true);
         label(panel_text, 120, 47, "MATCH PAUSED", gold_text);
         label(panel_text, 120, 68, "A  RESUME", ivory_text);
         label(panel_text, 120, 92, linked ? "B  LEAVE MATCH" : "B  CONCEDE", ivory_text);
-        label(panel_text, 120, 113, "SELECT  CONTROLS", mint_text);
+        label(panel_text, 120, 110, full_hud_enabled ? "UP / DOWN  FULL HUD" : "UP / DOWN  COMPACT HUD", mint_text);
+        if(lines)
+        {
+            label(panel_text, 120, 120, selected >= 0 ? bn::format<24>("L / R  LINE {} / {}", selected + 1, lines) :
+                  bn::string<24>("L / R  POCKET LINES"), mint_text);
+        }
+        label(panel_text, 120, 131, "SELECT  CONTROLS", muted_text);
     }
 
     void concession(bool linked)
@@ -467,7 +480,7 @@ public:
     }
 
     void scoreboard(const EightBall& game, const Profile& profile, const Rival& rival, Phase phase,
-                    int choices, int selected, int link_player, int call, int cursor_pocket, bool full)
+                    int choices, int selected, int link_player, int call, int cursor_pocket, bool full, CueSpin spin)
     {
         if(! match_hud || full != full_hud)
         {
@@ -539,6 +552,13 @@ public:
             position(bar[i], 104 + i * 8, ball_y);
         }
         show_power(true);
+        bool show_spin = phase == Phase::aim || phase == Phase::charge;
+        constexpr int spin_x = 226;
+        constexpr int spin_y = 148;
+        position(spin_ball, spin_x, spin_y);
+        position(spin_dot, spin_x + spin.side, spin_y - spin.vertical);
+        spin_ball.set_visible(show_spin);
+        spin_dot.set_visible(show_spin);
         if(full)
         {
             label(hud, 120, 8, "POWER", muted_text);
@@ -577,7 +597,7 @@ public:
             else if(selected >= 0)
             {
                 status(bn::format<24>("POCKET LINE {} / {}", selected + 1, choices),
-                       phase == Phase::charge ? "RELEASE A / B BACK" : "UP/DOWN CHANGE LINE");
+                       phase == Phase::charge ? "RELEASE A / B BACK" : "PAUSE  POCKET LINES");
             }
             else
             {
@@ -590,13 +610,16 @@ public:
         }
     }
 
-    bool update_camera(Vec cue, int angle, bool use_close_view, int pocket)
+    bool update_camera(Vec cue, int angle, bool use_close_view, int pocket, bool hold_camera)
     {
         if(use_close_view != close_view)
         {
             close_view = use_close_view;
             camera_angle = -1;
             staged_angle = -1;
+            camera_held = false;
+            staged_settle = false;
+            settle_steps = 0;
             line.clear();
             configure_projection(use_close_view);
             if(! use_close_view)
@@ -621,6 +644,21 @@ public:
             return true;
         }
 
+        if(hold_camera && camera_angle >= 0)
+        {
+            // Keep the last displayed pose throughout the shot and opponent's turn.
+            staged_angle = -1;
+            staged_settle = false;
+            settle_steps = 0;
+            camera_held = true;
+            return true;
+        }
+        if(! hold_camera && camera_held && camera_angle >= 0)
+        {
+            settle_steps = 8;
+        }
+        camera_held = hold_camera;
+
         // Stage the deck and its details on separate ticks, then commit the complete frame.
         if(staged_angle >= 0)
         {
@@ -635,25 +673,49 @@ public:
             camera_angle = staged_angle;
             ++camera_revision;
             staged_angle = -1;
+            staged_settle = false;
             background->set_visible(false);
             aim_backdrop->set_visible(true);
             aim_table.commit();
             return true;
         }
 
-        if(angle != camera_angle || cue.x != camera_anchor.x || cue.y != camera_anchor.y)
+        if(angle == camera_angle && cue.x == camera_anchor.x && cue.y == camera_anchor.y)
         {
-            staged_finished = false;
-            staged_camera = AimCamera(cue, angle);
-            staged_angle = angle;
-            staged_anchor = cue;
-            aim_table.draw(staged_camera);
-            return false;
+            settle_steps = 0;
+            return true;
         }
-        return true;
+        staged_settle = settle_steps > 0;
+        if(staged_settle)
+        {
+            int delta = angle_delta(angle, camera_angle);
+            angle = (camera_angle + delta / settle_steps) & (angle_count - 1);
+            cue = camera_anchor + Vec{ (cue.x - camera_anchor.x) / settle_steps,
+                                       (cue.y - camera_anchor.y) / settle_steps };
+            --settle_steps;
+        }
+        staged_finished = false;
+        staged_camera = AimCamera(cue, angle);
+        staged_angle = angle;
+        staged_anchor = cue;
+        aim_table.draw(staged_camera);
+        return false;
     }
 
     int displayed_angle() const { return camera_angle; }
+    bool camera_settling() const { return staged_settle || settle_steps > 0; }
+
+    int limit_aim_angle(int target) const
+    {
+        if(! close_view || camera_angle < 0 || camera_settling())
+        {
+            return target;
+        }
+        // Keep at most one small turn queued ahead of the pose currently being rendered.
+        constexpr int max_pose_turn = 7;
+        int base = staged_angle >= 0 ? staged_angle : camera_angle;
+        return (base + std::clamp(angle_delta(target, base), -max_pose_turn, max_pose_turn)) & (angle_count - 1);
+    }
 
     BN_CODE_IWRAM void show_balls(const Table& table, bool rolling, const Vec* placement, CueBallTint tint)
     {
@@ -663,10 +725,14 @@ public:
             if(invalid != (cue_tint != CueBallTint::ivory))
             {
                 balls[0].set_z_order(invalid ? -1 : 0);
+                balls[0].set_palette(invalid ? placement_flash_palette : ball_items[0]->palette_item());
                 depth_order_count = -1;
             }
-            balls[0].set_palette(tint == CueBallTint::bright_red ? placement_flash_palette :
-                                 ball_items[invalid ? 3 : 0]->palette_item());
+            if(invalid)
+            {
+                bn::sprite_palette_ptr palette = balls[0].palette();
+                palette.set_colors(tint == CueBallTint::bright_red ? placement_flash_palette : placement_red_palette);
+            }
             cue_tint = tint;
         }
 
@@ -919,6 +985,9 @@ private:
     Vec staged_anchor;
     int camera_angle = -1;
     int staged_angle = -1;
+    int settle_steps = 0;
+    bool camera_held = false;
+    bool staged_settle = false;
     bool full_hud = true;
     bool close_view = false;
     bool staged_finished = false;
@@ -936,6 +1005,8 @@ private:
     bn::sprite_ptr active_border[2] = {
         make_sprite(bn::sprite_items::active_player, 0), make_sprite(bn::sprite_items::active_player, 0, 1)
     };
+    bn::sprite_ptr spin_ball = make_sprite(bn::sprite_items::spin_ball, 0);
+    bn::sprite_ptr spin_dot = make_sprite(bn::sprite_items::spin_dot, -1);
     int bar_filled = 0;
 
 
@@ -966,17 +1037,18 @@ private:
 
     void status(const bn::string_view& message, const bn::string_view& action = {})
     {
+        int action_x = spin_ball.visible() ? 211 : 232;
         text.set_z_order(-3);
         label(footer, 9, 152, message, shadow_text, Align::LEFT);
         if(! action.empty())
         {
-            label(footer, 233, 152, action, shadow_text, Align::RIGHT);
+            label(footer, action_x + 1, 152, action, shadow_text, Align::RIGHT);
         }
         text.set_z_order(-4);
         label(footer, 8, 151, message, gold_text, Align::LEFT);
         if(! action.empty())
         {
-            label(footer, 232, 151, action, mint_text, Align::RIGHT);
+            label(footer, action_x, 151, action, mint_text, Align::RIGHT);
         }
         text.set_z_order(0);
     }
@@ -1086,6 +1158,8 @@ private:
         {
             edge.set_visible(false);
         }
+        spin_ball.set_visible(false);
+        spin_dot.set_visible(false);
         show_power(false);
     }
 };
@@ -1141,7 +1215,7 @@ public:
                         set_phase(Phase::aim);
                     }
                     screen = Screen::pause;
-                    view.pause(linked());
+                    show_pause();
                     break;
                 }
                 play();
@@ -1160,6 +1234,21 @@ public:
                     screen = Screen::concede;
                     view.concession(linked());
                 }
+                else if(bn::keypad::up_pressed() || bn::keypad::down_pressed())
+                {
+                    full_match_hud = ! full_match_hud;
+                    show_pause();
+                }
+                else if(phase == Phase::aim && ! finding_lines && suggestions.size() &&
+                        (bn::keypad::l_pressed() || bn::keypad::r_pressed()))
+                {
+                    int change = int(bn::keypad::r_pressed()) - int(bn::keypad::l_pressed());
+                    if(change)
+                    {
+                        cycle_pocket_line(change);
+                        show_pause();
+                    }
+                }
                 else if(bn::keypad::select_pressed())
                 {
                     screen = Screen::pause_help;
@@ -1171,7 +1260,7 @@ public:
                    bn::keypad::start_pressed())
                 {
                     screen = Screen::pause;
-                    view.pause(linked());
+                    show_pause();
                 }
                 break;
             case Screen::concede:
@@ -1192,7 +1281,7 @@ public:
                 else if(bn::keypad::b_pressed())
                 {
                     screen = Screen::pause;
-                    view.pause(linked());
+                    show_pause();
                 }
                 break;
             case Screen::result:
@@ -1257,11 +1346,10 @@ private:
     int selected_line = -1;
     int called_pocket = -1;
     int call_cursor = 0;
-    int pending_line = 0;
+    CueSpin spin;
     bool finding_lines = false;
     int aim_hold = 0;
     int previous_aim_input = 0;
-    bool previous_fine_aim = false;
     int charge = 0;
     int hold = 0;
     int timer = 0;
@@ -1326,10 +1414,16 @@ private:
         bn::sound_items::confirm.play(bn::fixed(0.55));
     }
 
+    void show_pause()
+    {
+        int lines = phase == Phase::aim && ! finding_lines ? suggestions.size() : 0;
+        view.pause(linked(), full_match_hud, lines, selected_line);
+    }
+
     void score()
     {
         view.scoreboard(game, records.profile(), rival(), phase, finding_lines ? 0 : suggestions.size(), selected_line,
-                        linked() ? cable.player() : -1, called_pocket, call_cursor, full_match_hud);
+                        linked() ? cable.player() : -1, called_pocket, call_cursor, full_match_hud, spin);
     }
 
     void set_phase(Phase value)
@@ -1372,6 +1466,7 @@ private:
     {
         placed_for_link = false;
         called_pocket = -1;
+        spin = {};
         if(linked())
         {
             cable.new_turn(turn_index, game.player != local_player());
@@ -1419,7 +1514,6 @@ private:
     void start_aiming()
     {
         selected_line = -1;
-        pending_line = 0;
         finding_lines = ! game.breaking;
         suggestions.start(called_pocket);
         set_phase(Phase::aim);
@@ -1447,36 +1541,37 @@ private:
         }
     }
 
-    void guide_input()
+    void update_suggestions()
     {
-        int change = int(bn::keypad::down_pressed()) - int(bn::keypad::up_pressed());
-        if(change)
+        if(finding_lines && suggestions.advance(game))
         {
-            pending_line = change;
-        }
-        if(finding_lines)
-        {
-            finding_lines = ! suggestions.advance(game);
-            if(finding_lines)
-            {
-                return;
-            }
-            if(! pending_line || ! suggestions.size())
-            {
-                score();
-            }
-        }
-        if(pending_line && suggestions.size())
-        {
-            int count = suggestions.size();
-            selected_line = selected_line < 0 ? 0 :
-                            (selected_line + pending_line + count) % count;
-            const Plan& choice = suggestions[selected_line];
-            angle = choice.angle;
-            aim_power = choice.speed;
+            finding_lines = false;
             score();
         }
-        pending_line = 0;
+    }
+
+    void cycle_pocket_line(int change)
+    {
+        int count = suggestions.size();
+        selected_line = selected_line < 0 ? 0 : (selected_line + change + count) % count;
+        const Plan& choice = suggestions[selected_line];
+        angle = choice.angle;
+        aim_power = choice.speed;
+        spin = {};
+    }
+
+    void spin_input()
+    {
+        int horizontal = int(bn::keypad::right_pressed()) - int(bn::keypad::left_pressed());
+        int vertical = int(bn::keypad::up_pressed()) - int(bn::keypad::down_pressed());
+        CueSpin next{ std::clamp(spin.side + horizontal, -max_spin, max_spin),
+                      std::clamp(spin.vertical + vertical, -max_spin, max_spin) };
+        if(next.side != spin.side || next.vertical != spin.vertical)
+        {
+            spin = next;
+            selected_line = -1;
+            score();
+        }
     }
 
     void local_shot(int speed)
@@ -1490,9 +1585,9 @@ private:
                 return;
             }
             Vec point = placed_for_link ? link_placement : Vec{};
-            cable.send_shot(turn_index, { angle, speed, point.x / unit, point.y / unit, called_pocket });
+            cable.send_shot(turn_index, { angle, speed, point.x / unit, point.y / unit, called_pocket, spin });
         }
-        strike(speed, called_pocket);
+        strike(speed, called_pocket, spin);
     }
 
     void remote_shot()
@@ -1504,7 +1599,7 @@ private:
         }
         Vec point = px(shot.x, shot.y);
         bool valid_call = game.requires_call() ? shot.pocket >= 0 && shot.pocket < 6 : shot.pocket == -1;
-        if(shot.speed < min_speed || shot.speed > max_speed || ! valid_call ||
+        if(shot.speed < min_speed || shot.speed > max_speed || ! valid_call || std::abs(shot.spin.side) > max_spin ||
            (game.ball_in_hand ? ! game.table.can_place(point) : (point.x || point.y)))
         {
             disconnect();
@@ -1517,13 +1612,13 @@ private:
         }
         cable.accept_shot();
         angle = shot.angle;
-        strike(shot.speed, shot.pocket);
+        strike(shot.speed, shot.pocket, shot.spin);
     }
 
-    void strike(int speed, int pocket)
+    void strike(int speed, int pocket, CueSpin shot_spin = {})
     {
         shot_origin = game.table.balls[0].pos;
-        game.table.strike(direction(angle), speed, pocket);
+        game.table.strike(direction(angle), speed, pocket, shot_spin);
         charge = speed;
         last_pots = 0;
         sound_cooldown = 0;
@@ -1533,22 +1628,16 @@ private:
 
     void steer()
     {
-        int input = int(bn::keypad::right_held()) - int(bn::keypad::left_held());
-        bool fine = bn::keypad::l_held() || bn::keypad::r_held();
-        if(! input && fine)
-        {
-            input = int(bn::keypad::r_held()) - int(bn::keypad::l_held());
-        }
-        if(input != previous_aim_input || fine != previous_fine_aim)
+        int input = int(bn::keypad::r_held()) - int(bn::keypad::l_held());
+        if(input != previous_aim_input)
         {
             aim_hold = 0;
             previous_aim_input = input;
-            previous_fine_aim = fine;
         }
         if(input)
         {
-            int amount = aim_step(aim_hold, fine);
-            angle = (angle + input * amount) & (angle_count - 1);
+            int amount = aim_step(aim_hold);
+            angle = view.limit_aim_angle((angle + input * amount) & (angle_count - 1));
             ++aim_hold;
             if(amount && selected_line >= 0)
             {
@@ -1622,11 +1711,6 @@ private:
     void play()
     {
         ++timer;
-        if(bn::keypad::l_held() && bn::keypad::r_held() && (bn::keypad::l_pressed() || bn::keypad::r_pressed()))
-        {
-            full_match_hud = ! full_match_hud;
-            score();
-        }
         if(phase != Phase::place && phase != Phase::call && bn::keypad::select_pressed())
         {
             prefer_close_view = ! prefer_close_view;
@@ -1635,8 +1719,9 @@ private:
         switch(phase)
         {
             case Phase::aim:
-                guide_input();
+                update_suggestions();
                 steer();
+                spin_input();
                 if(called_pocket >= 0 && bn::keypad::b_pressed())
                 {
                     call_cursor = called_pocket;
@@ -1670,6 +1755,7 @@ private:
                 else
                 {
                     steer();
+                    spin_input();
                     if(timer > 6)
                     {
                         charge = std::min(max_speed, charge + (timer < 24 ? 5 : 8));
@@ -1752,7 +1838,9 @@ private:
                      phase == Phase::cpu_aim ? cpu_plan.pocket :
                      phase == Phase::rolling ? game.table.shot.called_pocket :
                      phase == Phase::aim || phase == Phase::charge ? called_pocket : -1;
-        if(! view.update_camera(focus, heading, use_close_view, pocket))
+        bool hold_camera = phase == Phase::rolling || phase == Phase::cpu_wait || phase == Phase::cpu_aim ||
+                           phase == Phase::remote || phase == Phase::link_send;
+        if(! view.update_camera(focus, heading, use_close_view, pocket, hold_camera))
         {
             return;
         }
@@ -1767,6 +1855,11 @@ private:
             case Phase::aim:
             case Phase::charge:
             {
+                if(view.camera_settling())
+                {
+                    view.clear_aim();
+                    break;
+                }
                 int pullback = 0;
                 if(phase == Phase::charge)
                 {
@@ -1797,7 +1890,10 @@ private:
                 break;
             case Phase::cpu_aim:
                 view.clear_aim();
-                view.draw_cue(game.table, angle, std::clamp((timer - 12) / 2, 0, 12));
+                if(! use_close_view)
+                {
+                    view.draw_cue(game.table, angle, std::clamp((timer - 12) / 2, 0, 12));
+                }
                 break;
             case Phase::rolling:
                 view.clear_aim();

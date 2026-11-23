@@ -403,6 +403,53 @@ void bot_matches()
     }
     assert(pot_rate[rival_count - 1] > pot_rate[0] + 100);
 }
+
+void cue_spin()
+{
+    for(int side = -max_spin; side <= max_spin; ++side)
+    {
+        for(int vertical = -max_spin; vertical <= max_spin; ++vertical)
+        {
+            CueSpin decoded = decode_spin(encode_spin({ side, vertical }));
+            assert(decoded.side == side && decoded.vertical == vertical);
+        }
+    }
+
+    Table rail;
+    for(Ball& ball : rail.balls)
+    {
+        ball.live = false;
+    }
+    rail.balls[0] = { { right - unit, 84 * unit }, {}, true };
+    Table left_spin = rail;
+    Table right_spin = rail;
+    rail.strike(direction(0), max_speed);
+    left_spin.strike(direction(0), max_speed, -1, { -max_spin, 0 });
+    right_spin.strike(direction(0), max_speed, -1, { max_spin, 0 });
+    rail.step();
+    left_spin.step();
+    right_spin.step();
+    assert(rail.balls[0].velocity.x < 0 && rail.balls[0].velocity.y == 0);
+    assert(left_spin.balls[0].velocity.y < 0);
+    assert(right_spin.balls[0].velocity.y == -left_spin.balls[0].velocity.y);
+
+    Table contact;
+    for(Ball& ball : contact.balls)
+    {
+        ball.live = false;
+    }
+    contact.balls[0] = { px(70, 84), {}, true };
+    contact.balls[1] = { px(79, 84), {}, true };
+    Table follow = contact;
+    follow.strike(direction(0), max_speed, -1, { 0, max_spin });
+    contact.strike(direction(0), max_speed, -1, { 0, -max_spin });
+    follow.step();
+    contact.step();
+    assert(follow.shot.first == 1 && contact.shot.first == 1);
+    assert(follow.balls[0].velocity.x > 0 && contact.balls[0].velocity.x < 0);
+    assert(follow.balls[1].velocity.x == contact.balls[1].velocity.x);
+    assert(decode_spin(follow.shot.cue_spin).vertical == 0);
+}
 }
 
 int main()
@@ -411,6 +458,7 @@ int main()
     preview_and_suggestions();
     pocket_call_navigation();
     perspective_and_roll();
+    cue_spin();
     rules();
     rating();
     bot_matches();

@@ -13,6 +13,7 @@ struct CableShot
     int x = 0;
     int y = 0;
     int pocket = -1;
+    CueSpin spin;
 };
 
 class CableMatch

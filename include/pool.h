@@ -15,6 +15,24 @@ constexpr int bottom = 123 * unit;
 constexpr int min_speed = 120;
 constexpr int max_speed = 475;
 constexpr int angle_count = 1024;
+constexpr int max_spin = 4;
+
+struct CueSpin
+{
+    int side = 0;
+    int vertical = 0;
+};
+
+constexpr int spin_steps = 2 * max_spin + 1;
+constexpr uint8_t encode_spin(CueSpin spin)
+{
+    return uint8_t((spin.side + max_spin) * spin_steps + spin.vertical + max_spin);
+}
+
+constexpr CueSpin decode_spin(unsigned value)
+{
+    return { int(value / spin_steps) - max_spin, int(value % spin_steps) - max_spin };
+}
 
 struct Vec
 {
@@ -52,6 +70,7 @@ struct Shot
     bool rail_after_contact = false;
     int8_t eight_pocket = -1;
     int8_t called_pocket = -1;
+    uint8_t cue_spin = encode_spin({});
 };
 
 struct Ray
@@ -70,7 +89,7 @@ public:
     int impact = 0;
 
     void rack();
-    void strike(Vec heading, int speed, int called_pocket = -1);
+    void strike(Vec heading, int speed, int called_pocket = -1, CueSpin spin = {});
     bool step();
     bool can_place(Vec pos, int ignore = 0) const;
     void place_cue(Vec pos);
