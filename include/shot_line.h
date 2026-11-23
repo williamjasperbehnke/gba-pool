@@ -3,17 +3,12 @@
 
 #include "bn_optional.h"
 #include "bn_regular_bg_ptr.h"
-#include "pool.h"
+#include "pool_view.h"
 
 namespace pool
 {
-enum class LineInk { cue = 1, object, bank, warning };
-
-struct LineSpan
-{
-    Vec start;
-    Vec end;
-};
+enum class LineInk { cue = 1, warning };
+constexpr int ghost_ball_radius = 4 * unit;
 
 class ShotLine
 {
@@ -23,7 +18,9 @@ public:
     void clear();
     void begin();
     void commit();
-    void draw(Vec start, Vec end, LineInk ink, int lead, int tail, const LineSpan* avoid = nullptr);
+    void draw(Vec screen_start, Vec screen_end, LineInk ink);
+    void draw_to_ghost(Vec screen_start, Vec ghost_center, LineInk ink);
+    static bool ghost_visible(Vec center, const SphereProjection* nearby, int count);
 
 private:
     bn::optional<bn::regular_bg_ptr> background;

@@ -6,7 +6,7 @@ import random
 import struct
 import wave
 
-from PIL import Image, ImageDraw
+from PIL import Image, ImageChops, ImageDraw
 
 ROOT = Path(__file__).resolve().parents[1]
 GRAPHICS = ROOT / "graphics"
@@ -24,9 +24,21 @@ SCENE = [
     "#0b111a", "#121c29", "#202d3d", "#2f4255", "#465d6e", "#698490",
     "#9aafad", "#b6bba8", "#dedcc3", "#f6f1d8",
 ]
+# Match the native close-view table materials in src/aim_table.cpp.
+TABLE_COLORS = [
+    (9, 5, 5), (15, 8, 6), (22, 13, 8), (28, 19, 12),
+    (7, 16, 12), (9, 20, 14), (9, 7, 7), (3, 4, 5), (16, 10, 8),
+    (20, 11, 7), (30, 24, 15), (7, 17, 13),
+]
+(APRON_SHADE, APRON, WOOD, WOOD_LIGHT, NEAR_CUSHION, FAR_CUSHION, POCKET_WALL,
+ POCKET_THROAT, LEATHER, TRIM, SIGHT, FELT) = range(len(SCENE), len(SCENE) + len(TABLE_COLORS))
+TABLE_PALETTE = SCENE + ["#" + "".join(f"{round(channel * 255 / 31):02x}" for channel in rgb)
+                        for rgb in TABLE_COLORS]
+
 CUE = [
     "#ff00ff", "#27201d", "#50332a", "#865538", "#bd8653", "#edd29d",
-    "#ae7b4c", "#fff1d2", "#468b7b", "#82c3ad",
+    "#ae7b4c", "#fff1d2", "#3a656d", "#9bcdc6",
+    "#684233", "#e6b26a", "#344752", "#fffbe6",
 ]
 INK = [
     "#ff00ff", "#10242a", "#223947", "#48777e", "#73b49f", "#b8dfd0", "#f5f0d8",
@@ -92,8 +104,8 @@ def stamp(draw, label, x, y, color, scale=1, gap=1, centered=True):
         x += len(FONT[char][0]) * scale + gap
 
 
-def shell():
-    image = indexed((256, 256), SCENE, 1)
+def shell(colors=SCENE):
+    image = indexed((256, 256), colors, 1)
     draw = ImageDraw.Draw(image)
     draw.rectangle((0, 0, 239, 159), fill=2)
     for y in range(2, 159, 4):
@@ -105,73 +117,161 @@ def shell():
     return image, draw
 
 
-def table(draw, a, b, c, d):
-    draw.rounded_rectangle((a + 1, b + 4, c + 2, d + 3), 9, fill=15)
-    draw.rounded_rectangle((a, b, c, d), 9, fill=14, outline=15)
-    walnut, highlight, bevel_shadow, wood_grain, brass, brass_light = range(41, 47)
-    draw.rounded_rectangle((a + 1, b + 1, c - 1, d - 1), 8, fill=bevel_shadow, outline=13)
-    draw.rounded_rectangle((a + 2, b + 1, c - 2, d - 2), 8, fill=walnut, outline=wood_grain)
-    draw.line((a + 10, b + 2, c - 10, b + 2), fill=highlight)
-    draw.line((a + 10, d - 2, c - 10, d - 2), fill=bevel_shadow)
-    draw.line((a + 2, b + 11, a + 2, d - 11), fill=highlight)
-    draw.line((c - 2, b + 11, c - 2, d - 11), fill=bevel_shadow)
-    for x in range(a + 19, c - 20, 11):
-        draw.line((x, b + 4, x + 4, b + 4), fill=wood_grain)
-        draw.line((x + 2, d - 4, x + 6, d - 4), fill=wood_grain)
-    for y in range(b + 13, d - 13, 13):
-        draw.line((a + 5, y, a + 5, y + 5), fill=wood_grain)
-        draw.line((c - 4, y + 3, c - 4, y + 7), fill=wood_grain)
-    # The cushion noses border the displayed ball edges at the collision limits.
-    draw.rounded_rectangle((a + 6, b + 3, c - 5, d - 3), 5, fill=16)
-    draw.rectangle((a + 8, b + 5, c - 7, d - 5), fill=21)
+def table_projection(x, y, z=0):
+    # Match pool::project in pool_view.h for the fixed table mesh.
+    depth = 160 - (.28 * (y - 84) + .96 * z)
+    return round(120 + (x - 120) * 149 / depth), round(78 + (.96 * (y - 84) - .28 * z) * 149 / depth)
+
+
+def perspective_table(image, draw):
+    def face(vertices, fill):
+        draw.polygon([table_projection(*point) for point in vertices], fill=fill)
+
+    def quad(x0, y0, x1, y1, height, color):
+        face(((x0, y0, height), (x1, y0, height), (x1, y1, height), (x0, y1, height)), color)
+
+    draw.ellipse((12, 112, 227, 132), fill=15)
+    face(((6, 136, 3), (234, 136, 3), (234, 136, -15), (6, 136, -15)), APRON)
+    face(((6, 136, -5), (234, 136, -5), (234, 136, -9), (6, 136, -9)), TRIM)
+    draw.line((table_projection(6, 136, -14), table_projection(234, 136, -14)), fill=APRON_SHADE)
+
+    # A solid deck supports the rail joins and keeps the pocket trim inside the frame.
+    quad(6, 32, 234, 136, 0, WOOD)
+    quad(13, 39, 227, 129, 0, FELT)
     rng = random.Random(741)
-    for _ in range((c - a) * (d - b) // 7):
-        x, y = rng.randint(a + 8, c - 7), rng.randint(b + 5, d - 5)
-        draw.point((x, y), fill=rng.choice((20, 20, 21, 22, 22)))
-    for y, color in ((b + 3, 24), (b + 4, 19), (d - 4, 23), (d - 3, 16)):
-        draw.line((a + 8, y, c - 7, y), fill=color)
-    for x, color in ((a + 6, 23), (a + 7, 19), (c - 6, 23), (c - 5, 16)):
-        draw.line((x, b + 5, x, d - 5), fill=color)
-    center = (a + c + 1) // 2
-    for rail_start, rail_end in ((a, center), (center, c)):
-        for quarter in (1, 2, 3):
-            x = rail_start + (rail_end - rail_start) * quarter // 4
-            for y, toward_cloth in ((b + 2, 1), (d - 2, -1)):
-                draw.polygon(((x - 2, y), (x + 2, y), (x, y + 2 * toward_cloth)), fill=brass)
-                draw.line((x - 1, y, x + 1, y), fill=brass_light)
-    for quarter in (1, 2, 3):
-        y = b + (d - b) * quarter // 4
-        for x, toward_cloth in ((a + 3, 1), (c - 3, -1)):
-            draw.polygon(((x, y - 2), (x, y + 2), (x + 2 * toward_cloth, y)), fill=brass)
-            draw.line((x, y - 1, x, y + 1), fill=brass_light)
+    for _ in range(1200):
+        x, y = rng.randint(17, 223), rng.randint(42, 126)
+        draw.point(table_projection(x, y), fill=rng.choice((NEAR_CUSHION, FELT, FELT, FAR_CUSHION)))
 
-    for x in (a + 8, center, c - 7):
-        for y, toward_cloth in ((b + 5, 1), (d - 5, -1)):
-            for side in (-1, 1):
-                if (x == a + 8 and side < 0) or (x == c - 7 and side > 0):
-                    continue
-                shoulder = (x + side * 13, y + toward_cloth)
-                tip = (x + side * 5, y - toward_cloth * 2)
-                foot = (x + side * 7, y + toward_cloth * 2)
-                draw.polygon((shoulder, tip, foot), fill=16)
-                draw.line((shoulder, foot), fill=23)
-            draw.ellipse((x - 8, y - 6, x + 8, y + 6), fill=16)
-            draw.ellipse((x - 7, y - 6, x + 7, y + 5), fill=29, outline=30)
-            draw.ellipse((x - 5, y - 5, x + 5, y + 4), fill=15)
-            draw.arc((x - 6, y - 4, x + 6, y + 5), 20, 160, fill=7)
+    for edge, inner, nose, cushion in ((32, 40, 43, FAR_CUSHION), (136, 128, 125, NEAR_CUSHION)):
+        quad(6, min(edge, inner), 234, max(edge, inner), 3, WOOD)
+        draw.line((table_projection(6, edge, 3), table_projection(234, edge, 3)), fill=WOOD_LIGHT)
+        face(((14, inner, 3), (226, inner, 3), (226, nose, 0), (14, nose, 0)), cushion)
+        for first in (26, 130):
+            for x in range(first + 15, first + 74, 26):
+                inward = 1 if edge == 32 else -1
+                grain_y = edge + inward * (2 - (x & 1))
+                draw.line((table_projection(x - 11, grain_y, 3), table_projection(x + 4, grain_y, 3)),
+                          fill=APRON if x & 2 else WOOD_LIGHT)
+                draw.point(table_projection(x, edge + inward * 5, 3), fill=SIGHT)
+    for outer, inner, nose in ((6, 14, 17), (234, 226, 223)):
+        quad(min(outer, inner), 32, max(outer, inner), 136, 3, WOOD)
+        draw.line((table_projection(outer, 32, 3), table_projection(outer, 136, 3)), fill=WOOD_LIGHT)
+        face(((inner, 40, 3), (nose, 40, 0), (nose, 128, 0), (inner, 128, 3)), NEAR_CUSHION)
+        for y in (62, 84, 106):
+            inward = 1 if outer == 6 else -1
+            grain_x = outer + inward * (2 + y % 3)
+            draw.line((table_projection(grain_x, y - 7, 3), table_projection(grain_x, y + 4, 3)),
+                      fill=WOOD_LIGHT if y == 84 else APRON)
+            draw.point(table_projection(outer + inward * 5, y, 3), fill=SIGHT)
+
+    for pocket in range(6):
+        paint_pocket(image, pocket)
 
 
-def make_board():
-    image, draw = shell()
-    for x in (8, 128):
-        draw.rounded_rectangle((x, 4, x + 103, 33), 4, fill=36, outline=5)
-        draw.rounded_rectangle((x + 68, 7, x + 98, 16), 3, fill=3)
-        draw.line((x + 5, 18, x + 98, 18), fill=4)
-    table(draw, 9, 37, 230, 131)
-    draw.point((154, 84), fill=34)
-    draw.rounded_rectangle((8, 134, 231, 156), 3, fill=36, outline=5)
-    draw.line((13, 144, 226, 144), fill=4)
-    save(image, "room", "regular_bg", bpp_mode="bpp_8")
+POCKET_CENTERS = ((17, 42), (120, 42), (223, 42), (17, 126), (120, 126), (223, 126))
+
+
+def pocket_rings(pocket):
+    x, y = POCKET_CENTERS[pocket]
+    dx = (1, 0, -1)[pocket % 3]
+    dy = 1 if pocket < 3 else -1
+
+    def world(u, v):
+        if dx:
+            return (x + dx * (1 + ((u + v) * 181 + 128) // 256),
+                    y + dy * (1 + ((v - u) * 181 + 128) // 256))
+        return x + u, y + dy * v
+
+    width = 9 if dx else 11
+    rings = []
+    for w, depth in ((width, 7), (width - 1, 6), (width - 2, 5)):
+        shape = ((-2, -depth), (2, -depth), (w - 3, 2 - depth), (w - 1, 4 - depth), (w, 1),
+                 (w - 1, depth - 2), (w - 3, depth), (3 - w, depth), (1 - w, depth - 2),
+                 (-w, 1), (1 - w, 4 - depth), (3 - w, 2 - depth))
+        rings.append([world(u, v) for u, v in shape])
+    return rings
+
+
+def paint_pocket(image, pocket, called=False, offset=(0, 0)):
+    rim, mouth, throat = pocket_rings(pocket)
+    ox, oy = offset
+
+    def polygon(ring, z):
+        return [(x - ox, y - oy) for x, y in (table_projection(x, y, z) for x, y in ring)]
+
+    draw = ImageDraw.Draw(image)
+    outer = polygon(rim, 3)
+    draw.polygon(outer, fill=8 if called else LEATHER)
+    if not called:
+        draw.polygon(outer[4:10], fill=FAR_CUSHION if pocket < 3 else NEAR_CUSHION)
+    draw.line((outer[0], outer[1]), fill=9 if called else TRIM)
+    opening = polygon(mouth, 3)
+    draw.polygon(opening, fill=7 if called else POCKET_WALL)
+    mask = Image.new("1", image.size)
+    ImageDraw.Draw(mask).polygon(opening, fill=1)
+    floor = Image.new("1", image.size)
+    ImageDraw.Draw(floor).polygon(polygon(throat, 0), fill=1)
+    image.paste(1 if called else POCKET_THROAT, mask=ImageChops.logical_and(mask, floor))
+
+
+def make_pocket_art():
+    sheet = indexed((32, 6 * 32), INK)
+    centers = []
+    for pocket, center in enumerate(POCKET_CENTERS):
+        x, y = table_projection(*center, 3)
+        centers.append((x, y))
+        tile = indexed((32, 32), INK)
+        paint_pocket(tile, pocket, called=True, offset=(x - 16, y - 16))
+        sheet.paste(tile, (0, pocket * 32))
+    save(sheet, "called_pockets", "sprite", height=32, bpp_mode="bpp_4")
+
+    lines = ["#pragma once", "", "#include <cstdint>", "", "namespace pool", "{",
+             "inline constexpr uint8_t overview_pocket_centers[6][2] = {"]
+    lines.extend(f"    {{ {x}, {y} }}," for x, y in centers)
+    lines.extend(("};", "}", ""))
+    (ROOT / "include" / "pocket_art.h").write_text(chr(10).join(lines))
+
+
+def pool_room(draw):
+    draw.rectangle((0, 0, 239, 63), fill=2)
+    draw.rectangle((0, 64, 239, 83), fill=3)
+    draw.line((0, 84, 239, 84), fill=4)
+    draw.rectangle((0, 85, 239, 159), fill=1)
+
+
+def make_match_hud(compact=False):
+    image = indexed((256, 256), [SCENE[i] for i in (0, 1, 5, 3, 4)])
+    draw = ImageDraw.Draw(image)
+    bottom = 16 if compact else 26
+    for x0, x1 in ((3, 91), (96, 143), (148, 236)):
+        draw.rounded_rectangle((x0, 2, x1, bottom), 3, fill=3, outline=2)
+        if not compact:
+            draw.rounded_rectangle((x0 + 2, 4, x1 - 2, 13), 2, fill=1)
+    save(image, "match_hud_compact" if compact else "match_hud", "regular_bg", bpp_mode="bpp_4")
+
+
+def make_board(overview=True):
+    colors = TABLE_PALETTE if overview else SCENE
+    image = indexed((256, 256), colors, 1)
+    draw = ImageDraw.Draw(image)
+    pool_room(draw)
+    if overview:
+        perspective_table(image, draw)
+        draw.point(table_projection(154, 84), fill=34)
+    if overview:
+        save(image, "room", "regular_bg", bpp_mode="bpp_8")
+    else:
+        colors = [0] + sorted(color for _, color in image.getcolors() if color)
+        assert len(colors) <= 16
+        indices = [0] * 256
+        for index, color in enumerate(colors):
+            indices[color] = index
+        stage = image.point(indices)
+        old_palette = image.getpalette()
+        stage_palette = [channel for color in colors for channel in old_palette[color * 3:color * 3 + 3]]
+        stage.putpalette(stage_palette + [0] * (768 - len(stage_palette)))
+        save(stage, "aim_stage", "regular_bg", bpp_mode="bpp_4")
 
 
 def title_art(image, draw, x, y, radius):
@@ -271,102 +371,131 @@ def make_title():
     stamp(draw, "RANKED", 34, 128, 9, gap=2, centered=False)
     stamp(draw, "B", 135, 128, 10, centered=False)
     stamp(draw, "LINK CABLE", 150, 128, 9, gap=2, centered=False)
-    stamp(draw, "SELECT  CONTROLS", 120, 148, 8, gap=2)
+    draw.rounded_rectangle((77, 145, 113, 155), 2, fill=4)
+    stamp(draw, "SELECT", 95, 148, 9)
+    stamp(draw, "CONTROLS", 120, 148, 8, centered=False)
     save(image, "lobby", "regular_bg", bpp_mode="bpp_8")
 
 
 def make_menu():
     image, draw = shell()
-    draw.rounded_rectangle((8, 10, 231, 148), 5, fill=16, outline=5)
-    draw.polygon(((171, 12), (228, 12), (228, 145), (111, 145)), fill=39)
-    draw.polygon(((220, 12), (228, 12), (228, 145), (162, 145)), fill=38)
+    draw.rounded_rectangle((10, 10, 229, 149), 6, fill=36, outline=4)
     save(image, "menu", "regular_bg", bpp_mode="bpp_8")
 
 
-def make_panel():
-    colors = [SCENE[i] for i in (0, 15, 5, 4, 36, 3, 23, 11, 10, 9)]
+def make_panel(paused=False):
+    colors = [SCENE[i] for i in (0, 15, 5, 4, 36, 3, 23, 17)]
     image = indexed((256, 256), colors)
     draw = ImageDraw.Draw(image)
-    draw.rounded_rectangle((22, 37, 219, 130), 7, fill=1)
-    draw.rounded_rectangle((20, 34, 219, 127), 6, fill=2, outline=1)
-    draw.rounded_rectangle((22, 36, 217, 125), 5, fill=4, outline=3)
-    draw.rounded_rectangle((25, 39, 214, 58), 3, fill=3)
-    for x in (31, 208):
-        draw.polygon(((x - 2, 48), (x, 46), (x + 2, 48), (x, 50)), fill=7)
-    draw.rounded_rectangle((28, 105, 211, 121), 3, fill=3)
-    save(image, "panel", "regular_bg", bpp_mode="bpp_4")
+    if paused:
+        draw.rounded_rectangle((50, 36, 192, 126), 7, fill=1)
+        draw.rounded_rectangle((48, 33, 191, 123), 6, fill=4, outline=2)
+        draw.rounded_rectangle((62, 59, 177, 77), 4, fill=7, outline=6)
+        draw.rounded_rectangle((62, 83, 177, 101), 4, fill=5, outline=2)
+    else:
+        draw.rounded_rectangle((23, 22, 220, 146), 7, fill=1)
+        draw.rounded_rectangle((21, 19, 218, 143), 6, fill=4, outline=2)
+        draw.rounded_rectangle((27, 25, 212, 42), 3, fill=5)
+        draw.rounded_rectangle((28, 121, 211, 138), 3, fill=5)
+    save(image, "pause_panel" if paused else "panel", "regular_bg", bpp_mode="bpp_4")
+
+
+def blend(first, second, ratio):
+    channels = (round(int(first[i:i+2], 16) * (1 - ratio) + int(second[i:i+2], 16) * ratio)
+                for i in (1, 3, 5))
+    return "#" + "".join(f"{channel:02x}" for channel in channels)
 
 
 def make_sprites():
     for number in range(16):
         shade = BALLS[number if number <= 8 else number - 8]
-        colors = ["#ff00ff", "#18312d", *shade, "#829188", "#c7d1b9", "#fff1d5"]
-        image = indexed((8, 16), colors)
+        low, mid, high = shade if number else ("#68837c", "#a3b8aa", "#e2e6d2")
+        gloss = "#464b54" if number == 8 else blend(high, "#fff4d9", .26)
+        if number == 0:
+            gloss = "#fff9e7"
+        colors = ["#ff00ff", "#18312d", *shade, "#a4b5ab", "#d5ded0", "#eee9d6",
+                  blend(low, "#101823", .46), low, mid, high, gloss, "#687d76", "#fff7e3"]
+        image = indexed((16, 16), colors)
         draw = ImageDraw.Draw(image)
-        # A centered silhouette stays inside the collision circle at contact.
-        half_widths = (1, 2, 3, 3, 3, 2, 1)
-        for dy, half_width in enumerate(half_widths, -3):
-            for dx in range(-half_width, half_width + 1):
-                shade = 2 if dx + dy >= 2 else 3 if dx + dy >= -2 else 4
-                if number > 8 and abs(dy) >= 2:
-                    shade = 6 if dy > 0 else 7
-                draw.point((4 + dx, 4 + dy), fill=shade)
-        if number == 0 or number > 8:
-            draw.point((3, 2), fill=7)
-        # The five-pixel scoreboard icon shares the sprite's center.
-        draw.ellipse((2, 10, 6, 14), fill=2)
-        draw.ellipse((2, 10, 5, 13), fill=3)
-        if number > 8:
-            draw.line((3, 10, 5, 10), fill=7)
-            draw.line((3, 14, 5, 14), fill=6)
-        else:
-            draw.point((3, 11), fill=4)
-        save(image, f"ball_{number}", "sprite", height=8, bpp_mode="bpp_4")
+        for y in range(3, 13):
+            for x in range(3, 13):
+                dx = (x - 7.5) / 5.0
+                dy = (y - 7.5) / 5.0
+                depth = 1 - dx * dx - dy * dy
+                if depth < 0:
+                    continue
+                light = .78 * math.sqrt(depth) - .30 * dx - .45 * dy
+                ink = 8 + sum(light > level for level in (.08, .33, .60, .83))
+                stripe_axis = .34 * dx + .86 * dy + .39 * math.sqrt(depth)
+                if number > 8 and abs(stripe_axis) > .46:
+                    ink = (13, 5, 6, 7, 14)[ink - 8]
+                draw.point((x, y), fill=ink)
+        save(image, f"ball_{number}", "sprite", bpp_mode="bpp_4")
 
-    marks = indexed((8, 8 * 3), INK)
+    marks = indexed((8, 8), INK)
     draw = ImageDraw.Draw(marks)
-    draw.ellipse((1, 1, 7, 7), outline=5)
-    draw.ellipse((1, 9, 7, 15), outline=11)
-    draw.polygon(((2, 19), (4, 17), (6, 19), (4, 21)), fill=8)
+    draw.line((2, 3, 6, 3), fill=15)
+    draw.line((1, 4, 7, 4), fill=15)
+    draw.line((2, 4, 6, 4), fill=1)
+    draw.line((3, 5, 5, 5), fill=15)
     save(marks, "marks", "sprite", height=8, bpp_mode="bpp_4")
 
-    pocket = indexed((16, 16), INK)
-    draw = ImageDraw.Draw(pocket)
-    for x, dx in ((1, 1), (15, -1)):
-        for y, dy in ((2, 1), (14, -1)):
-            draw.line((x, y, x + dx * 4, y), fill=4)
-            draw.line((x, y, x, y + dy * 2), fill=5)
-    draw.line((7, 3, 9, 3), fill=5)
-    draw.line((7, 13, 9, 13), fill=5)
-    save(pocket, "pocket_marker", "sprite", bpp_mode="bpp_4")
-
-    cursor = indexed((16, 32), INK)
-    draw = ImageDraw.Draw(cursor)
-    for frame, color in enumerate((5, 11)):
-        y = frame * 16
-        for x, horizontal in ((2, 1), (14, -1)):
-            for dy, vertical in ((2, 1), (14, -1)):
-                draw.line((x, y + dy, x + 3 * horizontal, y + dy), fill=color)
-                draw.line((x, y + dy, x, y + dy + 3 * vertical), fill=color)
-    save(cursor, "placement", "sprite", height=16, bpp_mode="bpp_4")
+    active = indexed((64, 32 * 4), INK)
+    for mode, bottom in enumerate((24, 14)):
+        border = indexed((89, 32), INK)
+        draw = ImageDraw.Draw(border)
+        draw.rounded_rectangle((0, 0, 88, bottom), 3, outline=8)
+        draw.line((5, 0, 83, 0), fill=9)
+        active.paste(border.crop((0, 0, 45, 32)), (0, mode * 64))
+        active.paste(border.crop((45, 0, 89, 32)), (0, mode * 64 + 32))
+    save(active, "active_player", "sprite", height=32, bpp_mode="bpp_4")
 
     stick = indexed((64, 32), CUE)
     draw = ImageDraw.Draw(stick)
-    draw.polygon(((0, 14), (20, 14), (58, 15), (63, 15), (63, 17),
-                  (58, 17), (20, 18), (0, 18)), fill=1)
-    draw.rectangle((2, 15, 23, 17), fill=2)
-    draw.line((3, 15, 24, 15), fill=3)
-    draw.line((3, 16, 24, 16), fill=4)
-    draw.line((8, 16, 19, 16), fill=3)
-    draw.line((21, 15, 21, 17), fill=4)
-    draw.line((25, 15, 25, 17), fill=5)
-    draw.polygon(((27, 15), (56, 15), (57, 17), (27, 17)), fill=6)
-    draw.line((26, 16, 57, 16), fill=5)
-    draw.line((34, 16, 56, 16), fill=7)
+    draw.polygon(((1, 13), (23, 13), (60, 15), (63, 15), (63, 17),
+                  (60, 17), (23, 19), (1, 19), (0, 18), (0, 14)), fill=1)
+    draw.rectangle((2, 14, 24, 18), fill=10)
+    draw.line((2, 14, 23, 14), fill=4)
+    draw.rectangle((6, 14, 20, 18), fill=12)
+    draw.line((7, 15, 19, 15), fill=3)
+    draw.line((7, 17, 19, 17), fill=2)
+    draw.line((3, 14, 3, 18), fill=11)
+    draw.line((21, 14, 21, 18), fill=11)
+    draw.polygon(((25, 14), (58, 15), (58, 17), (25, 18)), fill=6)
+    draw.line((25, 15, 57, 15), fill=7)
+    draw.line((27, 16, 57, 16), fill=5)
+    draw.line((25, 18, 37, 17), fill=10)
     draw.rectangle((58, 15, 61, 17), fill=7)
+    draw.line((58, 17, 61, 17), fill=6)
+    draw.line((59, 15, 61, 15), fill=13)
     draw.line((62, 15, 62, 17), fill=8)
-    draw.line((63, 15, 63, 17), fill=9)
+    draw.point((62, 16), fill=9)
+    draw.point((63, 16), fill=9)
     save(stick, "cue", "sprite", bpp_mode="bpp_4")
+
+    close_cue = indexed((8, 32 * 64), CUE)
+    draw = ImageDraw.Draw(close_cue)
+    for section in range(2):
+        for length in range(1, 33):
+            top = (section * 32 + length - 1) * 32
+            for pixel_row in range(length):
+                row = section * 32 + pixel_row
+                y = top + pixel_row
+                if row <= 1:
+                    draw.line((3, y, 5, y), fill=8)
+                    draw.point((4, y), fill=9)
+                elif row <= 5:
+                    draw.line((3, y, 5, y), fill=6)
+                    draw.point((3, y), fill=7)
+                    draw.point((4, y), fill=13 if row < 5 else 7)
+                else:
+                    edge = 1 if row >= 32 else 2 if row >= 15 else 3
+                    draw.line((edge, y, 5, y), fill=6)
+                    draw.point((4, y), fill=5)
+                    draw.point((5, y), fill=3)
+                    if row >= 23:
+                        draw.point((6, y), fill=2)
+    save(close_cue, "close_cue", "sprite", height=32, bpp_mode="bpp_4")
 
     meter = indexed((8, 8 * 9), INK)
     draw = ImageDraw.Draw(meter)
@@ -426,11 +555,17 @@ if __name__ == "__main__":
     GRAPHICS.mkdir(exist_ok=True)
     AUDIO.mkdir(exist_ok=True)
     make_board()
+    make_pocket_art()
+    make_board(overview=False)
+    make_match_hud()
+    make_match_hud(compact=True)
     make_title()
     make_menu()
     make_panel()
+    make_panel(paused=True)
     make_sprites()
     make_sound("strike", 0.065, 340, 0.53, 58)
     make_sound("click", 0.040, 730, 0.26, 95)
     make_sound("drop", 0.14, 165, 0.42, 25)
     make_sound("confirm", 0.10, 625, 0.02, 19)
+    make_sound("reject", 0.11, 225, 0.08, 25)

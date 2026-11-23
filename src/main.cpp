@@ -1,6 +1,7 @@
 #include <algorithm>
 #include <cstdint>
 #include <cstdlib>
+#include <cstring>
 
 #include "bn_array.h"
 #include "bn_core.h"
@@ -11,6 +12,9 @@
 #include "bn_sound_items.h"
 #include "bn_sprite_font.h"
 #include "bn_sprite_ptr.h"
+#include "bn_sprite_affine_mat_ptr.h"
+#include "bn_sprite_tiles_ptr.h"
+#include "bn_tile.h"
 #include "bn_sprite_text_generator.h"
 #include "bn_sram.h"
 #include "bn_string.h"
@@ -19,7 +23,11 @@
 #include "bn_regular_bg_items_lobby.h"
 #include "bn_regular_bg_items_menu.h"
 #include "bn_regular_bg_items_panel.h"
+#include "bn_regular_bg_items_pause_panel.h"
 #include "bn_regular_bg_items_room.h"
+#include "bn_regular_bg_items_match_hud.h"
+#include "bn_regular_bg_items_match_hud_compact.h"
+#include "bn_regular_bg_items_aim_stage.h"
 #include "bn_sprite_items_ball_0.h"
 #include "bn_sprite_items_ball_1.h"
 #include "bn_sprite_items_ball_2.h"
@@ -38,15 +46,19 @@
 #include "bn_sprite_items_ball_15.h"
 #include "bn_sprite_items_avatars.h"
 #include "bn_sprite_items_cue.h"
+#include "bn_sprite_items_close_cue.h"
 #include "bn_sprite_items_hud_font.h"
 #include "bn_sprite_items_marks.h"
 #include "bn_sprite_items_meter.h"
-#include "bn_sprite_items_placement.h"
-#include "bn_sprite_items_pocket_marker.h"
+#include "bn_sprite_items_active_player.h"
+#include "bn_sprite_items_called_pockets.h"
 
 #include "font_widths.h"
 #include "pool.h"
+#include "pocket_art.h"
 #include "pool_cable.h"
+#include "pool_view.h"
+#include "aim_table.h"
 #include "shot_line.h"
 
 namespace
@@ -62,6 +74,19 @@ constexpr const bn::sprite_item* ball_items[] = {
     &bn::sprite_items::ball_15
 };
 
+enum class CueBallTint { ivory, red, bright_red };
+
+constexpr auto placement_flash_colors = [] {
+    bn::array<bn::color, 16> colors{};
+    colors[8] = bn::color(11, 2, 3);
+    colors[9] = bn::color(18, 3, 5);
+    colors[10] = bn::color(25, 5, 7);
+    colors[11] = bn::color(31, 10, 11);
+    colors[12] = bn::color(31, 21, 19);
+    return colors;
+}();
+constexpr bn::sprite_palette_item placement_flash_palette(placement_flash_colors, bn::bpp_mode::BPP_4);
+
 constexpr bn::sprite_font hud_font(bn::sprite_items::hud_font, {}, font_widths, 2);
 constexpr auto text_colors(bn::color ink)
 {
@@ -73,22 +98,23 @@ constexpr auto text_colors(bn::color ink)
 constexpr auto mint_colors = text_colors(bn::color(20, 29, 25));
 constexpr auto gold_colors = text_colors(bn::color(31, 26, 14));
 constexpr auto muted_colors = text_colors(bn::color(18, 23, 23));
+constexpr auto shadow_text_colors = text_colors(bn::color(2, 4, 5));
 constexpr bn::sprite_palette_item mint_text(mint_colors, bn::bpp_mode::BPP_4);
 constexpr bn::sprite_palette_item gold_text(gold_colors, bn::bpp_mode::BPP_4);
 constexpr bn::sprite_palette_item muted_text(muted_colors, bn::bpp_mode::BPP_4);
+constexpr bn::sprite_palette_item shadow_text(shadow_text_colors, bn::bpp_mode::BPP_4);
 constexpr auto& ivory_text = bn::sprite_items::hud_font.palette_item();
 using Align = bn::sprite_text_generator::alignment_type;
 
-constexpr int meter_sections = 8;
-constexpr int cue_length = 48;
+constexpr int meter_sections = 5;
+constexpr int cue_length = 54;
 constexpr int break_power = 340;
 constexpr int rating_magic = 0x38425231;
 
-enum Mark { circle, foul_circle, turn_diamond };
 constexpr const char* pocket_names[] = {
     "TOP LEFT", "TOP MIDDLE", "TOP RIGHT", "BOTTOM LEFT", "BOTTOM MIDDLE", "BOTTOM RIGHT"
 };
-enum class Screen { lobby, match, help, pause, concede, result, link_wait, link_lost, link_leaving };
+enum class Screen { lobby, match, help, pause, pause_help, concede, result, link_wait, link_lost, link_leaving };
 enum class Phase { aim, charge, call, place, rolling, cpu_wait, cpu_aim, remote, link_send };
 
 struct SaveSlot
@@ -161,16 +187,6 @@ void position(bn::sprite_ptr& sprite, Vec coord)
     position(sprite, (coord.x + unit / 2) / unit, (coord.y + unit / 2) / unit);
 }
 
-const char* group_label(Group group)
-{
-    switch(group)
-    {
-        case Group::solids: return "SOLIDS";
-        case Group::stripes: return "STRIPES";
-        default: return "OPEN";
-    }
-}
-
 const char* foul_label(Notice notice)
 {
     switch(notice)
@@ -204,6 +220,21 @@ int aim_step(int held_frames, bool fine)
     return std::min(6, 2 + (held_frames - 20) / 7);
 }
 
+BN_DATA_EWRAM_BSS bn::tile sphere_tiles[16][sphere_words / 8];
+
+struct BallVisual
+{
+    RollingBall spin;
+    Vec previous;
+    SphereProjection projection{};
+    unsigned camera_revision = 0;
+    int zoom = -1;
+    uint16_t drawn_tiles = 0;
+    bool shadow_visible = false;
+    bool centered = false;
+    bool shown = false;
+};
+
 struct CueSprite
 {
     Vec center;
@@ -216,28 +247,27 @@ bn::optional<CueSprite> cue_sprite(const Table& table, int angle, int pullback)
     Vec cue = table.balls[0].pos;
     Vec heading = direction(angle);
     int gap = (7 + pullback) * unit;
-    int reach = gap + cue_length * unit;
-
-    // Keep the rear end inside the table frame, including during pullback.
-    if(heading.x)
-    {
-        int edge = heading.x > 0 ? 12 * unit : 227 * unit;
-        reach = std::min(reach, (cue.x - edge) * direction_unit / heading.x);
-    }
-    if(heading.y)
-    {
-        int edge = heading.y > 0 ? 37 * unit : 130 * unit;
-        reach = std::min(reach, (cue.y - edge) * direction_unit / heading.y);
-    }
-    gap = std::clamp(reach - 5 * unit, 4 * unit, gap);
-    int size = reach - gap;
-    if(size < 3 * unit)
+    Vec center = project(cue, ball_height);
+    Vec rear = project(cue - travel(heading, gap + cue_length * unit), ball_height);
+    Vec front = project(cue - travel(heading, gap), ball_height);
+    Vec clipped_center = center;
+    if(! clip_view_segment(rear, clipped_center))
     {
         return bn::nullopt;
     }
 
-    // Table angles grow clockwise in screen coordinates. Butano uses the opposite sign.
-    return CueSprite{ cue - travel(heading, gap + size / 2), (-angle) & (angle_count - 1), size };
+    Vec axis = center - rear;
+    int available = length(axis);
+    if(available < 2 * unit)
+    {
+        return bn::nullopt;
+    }
+    int setback = std::min(length(center - front), available - std::min(8 * unit, available / 2));
+    front = center - travel(normalized(axis), setback);
+    Vec shaft = front - rear;
+    // Butano's sprite rotation uses the opposite sign from screen coordinates.
+    return CueSprite{ { (rear.x + front.x) / 2, (rear.y + front.y) / 2 },
+                      (-direction_angle(shaft)) & (angle_count - 1), length(shaft) };
 }
 
 class View
@@ -246,23 +276,41 @@ public:
     View()
     {
         stick.set_bg_priority(1);
+        close_stick.set_bg_priority(1);
+        close_tail.set_bg_priority(1);
+        for(bn::sprite_ptr& edge : active_border)
+        {
+            edge.set_bg_priority(0);
+        }
+        called.set_bg_priority(3);
+        for(int i = 0; i < 8; ++i)
+        {
+            bn::sprite_affine_mat_ptr scale = bn::sprite_affine_mat_ptr::create();
+            scale.set_scale(bn::fixed(2 + i) / 5);
+            scales.push_back(std::move(scale));
+        }
         for(int id = 0; id < 16; ++id)
         {
-            balls.push_back(make_sprite(*ball_items[id], 0));
+            bn::sprite_tiles_item tiles(sphere_tiles[id], bn::bpp_mode::BPP_4);
+            bn::sprite_item sphere(bn::sprite_shape_size(sphere_sprite_size, sphere_sprite_size),
+                                   tiles, ball_items[id]->palette_item());
+            balls.push_back(make_sprite(sphere, 0));
+            shadows.push_back(make_sprite(bn::sprite_items::marks, 6));
         }
         for(int id = 0; id < 14; ++id)
         {
-            group_balls.push_back(make_sprite(*ball_items[1], 0, 1));
+            group_balls.push_back(make_sprite(*ball_items[1], 0));
+            group_balls.back().set_bg_priority(0);
         }
         for(int i = 0; i < 2; ++i)
         {
             avatars.push_back(make_sprite(bn::sprite_items::avatars, 0, i));
-            position(avatars.back(), 15 + i * 120, 12);
+            avatars.back().set_bg_priority(0);
         }
         for(int index = 0; index < meter_sections; ++index)
         {
             bar.push_back(make_sprite(bn::sprite_items::meter, 1));
-            position(bar.back(), 47 + index * 8, 151);
+            bar.back().set_bg_priority(0);
         }
     }
 
@@ -270,6 +318,9 @@ public:
     {
         clear_panel();
         line.close();
+        aim_table.close();
+        aim_backdrop.reset();
+        close_view = false;
         background.reset();
         background = bn::regular_bg_items::lobby.create_bg(8, 48);
         background->set_priority(3);
@@ -287,6 +338,9 @@ public:
     {
         clear_panel();
         line.close();
+        aim_table.close();
+        aim_backdrop.reset();
+        close_view = false;
         background.reset();
         background = bn::regular_bg_items::menu.create_bg(8, 48);
         background->set_priority(3);
@@ -295,52 +349,72 @@ public:
         footer.clear();
     }
 
-    void show_room()
+    void show_room(bool start_close)
     {
         clear_panel();
+        hide_match_hud();
         line.close();
+        aim_table.close();
+        aim_backdrop.reset();
+        close_view = false;
         background.reset();
         background = bn::regular_bg_items::room.create_bg(8, 48);
         background->set_priority(3);
-        line.show();
+        background->set_visible(! start_close);
+        aim_backdrop = bn::regular_bg_items::aim_stage.create_bg(8, 48);
+        aim_backdrop->set_priority(3);
+        aim_backdrop->set_visible(start_close);
+        configure_projection(false);
+        for(int id = 0; id < 16; ++id)
+        {
+            uint16_t drawn_tiles = sphere_pose[id].drawn_tiles;
+            sphere_pose[id] = {};
+            sphere_pose[id].drawn_tiles = drawn_tiles;
+            if(id >= 9)
+            {
+                sphere_pose[id].spin = { id & 1 ? 320 : -320, 800, -552 };
+            }
+        }
         hud.clear();
         footer.clear();
     }
 
-    void controls(bool paused, bool linked = false)
+    void controls(bool paused)
     {
         if(! paused)
         {
             show_menu();
         }
         open_panel();
-        label(panel_text, 120, 49, paused ? "MATCH PAUSED" : "HOW TO PLAY", gold_text);
-        label(panel_text, 36, 66, "LEFT / RIGHT", mint_text, Align::LEFT);
-        label(panel_text, 112, 66, "AIM", ivory_text, Align::LEFT);
-        label(panel_text, 36, 73, "L / R", mint_text, Align::LEFT);
-        label(panel_text, 112, 73, "FINE AIM", ivory_text, Align::LEFT);
-        label(panel_text, 36, 80, "UP / DOWN", mint_text, Align::LEFT);
-        label(panel_text, 112, 80, "CYCLE POCKET LINES", ivory_text, Align::LEFT);
-        label(panel_text, 36, 87, "HOLD A", mint_text, Align::LEFT);
-        label(panel_text, 112, 87, "RELEASE TO SHOOT", ivory_text, Align::LEFT);
-        label(panel_text, 36, 94, "B", mint_text, Align::LEFT);
-        label(panel_text, 112, 94, "CANCEL / RESET POWER", ivory_text, Align::LEFT);
-        label(panel_text, 36, 101, "D-PAD / A", mint_text, Align::LEFT);
-        label(panel_text, 112, 101, "MOVE / PLACE CUE", ivory_text, Align::LEFT);
-        if(paused)
+        label(panel_text, 120, 34, "HOW TO PLAY", gold_text);
+        constexpr const char* buttons[] = {
+            "LEFT / RIGHT", "L / R", "L + R", "UP / DOWN", "SELECT", "HOLD A", "B", "D-PAD / A"
+        };
+        constexpr const char* actions[] = {
+            "AIM", "FINE AIM", "CHANGE HUD SIZE", "CYCLE POCKET LINES", "SWITCH CAMERAS",
+            "RELEASE TO SHOOT", "CANCEL / RECALL 8", "MOVE / PLACE CUE"
+        };
+        for(int row = 0; row < 8; ++row)
         {
-            panel_actions("A  RESUME", linked ? "B  LEAVE" : "B  CONCEDE");
+            label(panel_text, 39, 51 + row * 9, buttons[row], mint_text, Align::LEFT);
+            label(panel_text, 112, 51 + row * 9, actions[row], ivory_text, Align::LEFT);
         }
-        else
-        {
-            label(panel_text, 120, 113, "A / B  BACK", gold_text);
-        }
+        label(panel_text, 120, 130, "A / B  BACK", gold_text);
+    }
+
+    void pause(bool linked)
+    {
+        open_panel(true);
+        label(panel_text, 120, 47, "MATCH PAUSED", gold_text);
+        label(panel_text, 120, 68, "A  RESUME", ivory_text);
+        label(panel_text, 120, 92, linked ? "B  LEAVE MATCH" : "B  CONCEDE", ivory_text);
+        label(panel_text, 120, 113, "SELECT  CONTROLS", mint_text);
     }
 
     void concession(bool linked)
     {
         open_panel();
-        label(panel_text, 120, 49, linked ? "LEAVE LINK MATCH" : "CONCEDE MATCH", gold_text);
+        label(panel_text, 120, 34, linked ? "LEAVE LINK MATCH" : "CONCEDE MATCH", gold_text);
         label(panel_text, 120, 80, linked ? "THIS ENDS THE MATCH FOR BOTH PLAYERS" : "THIS COUNTS AS A RANKED LOSS");
         panel_actions(linked ? "A  LEAVE" : "A  CONCEDE", "B  BACK");
     }
@@ -348,10 +422,17 @@ public:
     void link_status(const char* heading, const char* first, const char* second, const char* action)
     {
         open_panel();
-        label(panel_text, 120, 49, heading, gold_text);
-        label(panel_text, 120, 75, first);
-        label(panel_text, 120, 88, second, muted_text);
-        label(panel_text, 120, 113, action, mint_text);
+        label(panel_text, 120, 34, heading, gold_text);
+        bool has_detail = second[0] != '\0';
+        label(panel_text, 120, has_detail ? 70 : 80, first);
+        if(has_detail)
+        {
+            label(panel_text, 120, 86, second, muted_text);
+        }
+        if(action[0] != '\0')
+        {
+            label(panel_text, 120, 130, action, mint_text);
+        }
     }
 
     void link_result(bool won, const char* reason)
@@ -362,19 +443,19 @@ public:
     void result(bool won, const char* reason, const Profile& profile, int change, int new_rival)
     {
         open_panel();
-        label(panel_text, 120, 49, won ? "YOU WIN" : "YOU LOSE", gold_text);
-        label(panel_text, 120, 70, reason, muted_text);
+        label(panel_text, 120, 34, won ? "YOU WIN" : "YOU LOSE", gold_text);
+        label(panel_text, 120, 66, reason, muted_text);
         label(panel_text, 120, 81,
               bn::format<48>("RATING {}  {}{}", profile.rating, change >= 0 ? "+" : "-", change >= 0 ? change : -change),
               mint_text);
         if(new_rival >= 0)
         {
-            label(panel_text, 120, 92,
+            label(panel_text, 120, 97,
                   bn::format<48>("UNLOCKED  {} / {}", rivals[new_rival].name, rivals[new_rival].rank));
         }
         else
         {
-            label(panel_text, 120, 92, bn::format<48>("{} W / {} L   BEST {}", profile.wins, profile.losses, profile.best));
+            label(panel_text, 120, 97, bn::format<48>("{} W / {} L   BEST {}", profile.wins, profile.losses, profile.best));
         }
         panel_actions("A  NEXT MATCH", "B  LOBBY");
     }
@@ -385,142 +466,316 @@ public:
         panel.reset();
     }
 
-    void scoreboard(const EightBall& game, const Profile& profile, const Rival& rival, Phase phase, int choices, int selected, int link_player, int call, int cursor_pocket)
+    void scoreboard(const EightBall& game, const Profile& profile, const Rival& rival, Phase phase,
+                    int choices, int selected, int link_player, int call, int cursor_pocket, bool full)
     {
+        if(! match_hud || full != full_hud)
+        {
+            match_hud.reset();
+            const auto& item = full ? bn::regular_bg_items::match_hud : bn::regular_bg_items::match_hud_compact;
+            match_hud = item.create_bg(8, 48);
+            match_hud->set_priority(0);
+            full_hud = full;
+        }
         hud.clear();
         footer.clear();
         bool linked = link_player >= 0;
         int local = linked ? link_player : 0;
-        position(turn, game.player ? 183 : 63, 12);
-        turn.set_visible(true);
+        int ball_y = full ? 20 : 9;
+        int card_left = game.player ? 148 : 3;
+        for(int side = 0; side < 2; ++side)
+        {
+            bn::sprite_ptr& edge = active_border[side];
+            edge.set_tiles(bn::sprite_items::active_player.tiles_item(), (full ? 0 : 2) + side);
+            position(edge, card_left + 32 + 45 * side, 18);
+            edge.set_visible(true);
+        }
 
         for(int player = 0; player < 2; ++player)
         {
-            avatars[player].set_tiles(bn::sprite_items::avatars.tiles_item(), linked ? player : player ? 2 : 0);
-            avatars[player].set_visible(true);
-            Group group = game.groups[player];
-            int x = player * 120;
-            int start = group == Group::stripes ? 9 : 1;
-            bool on_eight = group != Group::open && game.remaining(group) == 0;
-            const auto& name_color = player == game.player ? gold_text : ivory_text;
-            const char* name = player == local ? "YOU" : linked ? "FRIEND" : rival.name;
-            label(hud, x + 23, 12, name, name_color, Align::LEFT);
-            label(hud, x + 104, 12, linked ? bn::format<12>("GBA {}", player + 1) :
-                  bn::format<12>("{}", player ? rival.rating : profile.rating), mint_text, Align::RIGHT);
-            label(hud, x + 15, 26, on_eight ? "8 BALL" : group_label(group), muted_text, Align::LEFT);
+            int center = player ? 192 : 47;
+            if(full)
+            {
+                int left = center - 44;
+                avatars[player].set_tiles(bn::sprite_items::avatars.tiles_item(), linked ? player : player ? 2 : 0);
+                position(avatars[player], left + 8, 8);
+                const auto& name_color = player == game.player ? gold_text : ivory_text;
+                const char* name = player == local ? "YOU" : linked ? "FRIEND" : rival.name;
+                label(hud, left + 15, 8, name, name_color, Align::LEFT);
+                label(hud, center + 39, 8, linked ? bn::format<12>("GBA {}", player + 1) :
+                      bn::format<12>("{}", player ? rival.rating : profile.rating), mint_text, Align::RIGHT);
+            }
+            avatars[player].set_visible(full);
 
+            // Before assignment the two rows show the two groups still on the table.
+            Group group = game.groups[player];
+            bool assigned = group != Group::open;
+            if(! assigned)
+            {
+                group = player ? Group::stripes : Group::solids;
+            }
+            int count = game.remaining(group);
+            bool on_eight = assigned && count == 0;
+            int first = group == Group::stripes ? 9 : 1;
             int visible = 0;
-            int count = on_eight ? 1 : game.remaining(group);
             for(int index = 0; index < 7; ++index)
             {
                 bn::sprite_ptr& icon = group_balls[player * 7 + index];
-                int id = start + index;
-                bool show = group != Group::open && (on_eight ? index == 0 : game.table.balls[id].live);
+                int id = first + index;
+                bool show = on_eight ? index == 0 : game.table.balls[id].live;
                 if(show)
                 {
-                    icon.set_item(*ball_items[on_eight ? 8 : id], 1);
-                    position(icon, x + 76 + (2 * visible - (count - 1)) * 4, 26);
+                    icon.set_item(*ball_items[on_eight ? 8 : id]);
+                    int offset = on_eight ? 0 : (2 * visible - (count - 1)) * 6;
+                    position(icon, center + offset, ball_y);
                     ++visible;
                 }
                 icon.set_visible(show);
             }
         }
 
-        bool human_aim = phase == Phase::aim || phase == Phase::charge;
-        bool human_shot = phase == Phase::rolling && game.player == local;
-        show_power(human_aim || human_shot);
+        for(int i = 0; i < meter_sections; ++i)
+        {
+            position(bar[i], 104 + i * 8, ball_y);
+        }
+        show_power(true);
+        if(full)
+        {
+            label(hud, 120, 8, "POWER", muted_text);
+        }
+
         if(phase == Phase::call)
         {
-            label(footer, 120, 139, bn::format<48>("CALL THE 8 / {}", pocket_names[cursor_pocket]), gold_text);
-            label(footer, 120, 151, call < 0 ? "D-PAD  CHOOSE    A  CALL" :
-                  "D-PAD  CHOOSE   A  CALL   B  BACK", mint_text);
+            status(bn::format<32>("CALL: {}", pocket_names[cursor_pocket]), "D-PAD CYCLE / A CALL");
         }
         else if(phase == Phase::place)
         {
-            label(footer, 120, 139, bn::format<48>("{}  /  BALL IN HAND", foul_label(game.notice)), gold_text);
-            label(footer, 120, 151, "D-PAD  MOVE     A  PLACE", mint_text);
+            status(foul_label(game.notice), "D-PAD MOVE / A PLACE");
         }
-        else if(phase == Phase::remote || phase == Phase::link_send)
+        else if(full)
         {
-            label(footer, 120, 139, phase == Phase::remote ?
-                  (game.ball_in_hand ? "FRIEND HAS BALL IN HAND" : "FRIEND IS AIMING") : "SYNCING SHOT");
-            label(footer, 120, 151, "LINK CABLE", muted_text);
-        }
-        else if(phase == Phase::cpu_wait || phase == Phase::cpu_aim)
-        {
-            if(game.ball_in_hand)
+            if(phase == Phase::remote || phase == Phase::link_send)
             {
-                label(footer, 120, 139, bn::format<48>("{}  /  {} HAS BALL IN HAND", foul_label(game.notice), rival.name));
+                status(phase == Phase::link_send ? "SYNCING SHOT" :
+                       game.ball_in_hand ? "FRIEND HAS BALL IN HAND" : "FRIEND IS AIMING");
             }
-            else
+            else if(phase == Phase::cpu_wait || phase == Phase::cpu_aim)
             {
-                label(footer, 120, 139, bn::format<32>("{} {}", rival.name, game.breaking ? "BREAKS" : "IS AIMING"));
+                status(bn::format<32>("{} {}", rival.name, game.breaking ? "BREAKS" : "IS AIMING"),
+                       game.ball_in_hand ? "BALL IN HAND" : "");
             }
-            label(footer, 120, 151, rival.rank, muted_text);
-        }
-        else if(phase == Phase::rolling)
-        {
-            label(footer, 120, 139, game.player == local ? bn::string<32>("YOUR SHOT") :
-                  bn::format<32>("{} SHOT", linked ? "FRIEND" : rival.name));
-            label(footer, 224, 151, "START  PAUSE", muted_text, Align::RIGHT);
-        }
-        else
-        {
-            const char* status = "YOUR TURN";
-            if(game.notice == Notice::spotted)
+            else if(phase == Phase::rolling)
             {
-                status = "8 BALL RESPOTTED";
+                status(game.player == local ? bn::string<32>("YOUR SHOT") :
+                       bn::format<32>("{} SHOT", linked ? "FRIEND" : rival.name));
             }
-            else if(game.breaking)
+            else if(call >= 0)
             {
-                status = "YOUR BREAK";
-            }
-            else if(game.legal_target(8))
-            {
-                status = "SINK THE 8 BALL";
-            }
-            else if(game.groups[0] == Group::open)
-            {
-                status = "YOUR TURN  /  OPEN TABLE";
-            }
-            if(call >= 0)
-            {
-                label(footer, 120, 139, bn::format<48>("CALLED {}{}", pocket_names[call],
-                      choices ? " / UP-DOWN LINE" : ""), gold_text);
+                status(bn::format<32>("CALLED {}", pocket_names[call]),
+                       phase == Phase::charge ? "RELEASE A / B BACK" : "B CHANGE POCKET");
             }
             else if(selected >= 0)
             {
-                label(footer, 120, 139, bn::format<24>("POCKET LINE {} / {}", selected + 1, choices), gold_text);
+                status(bn::format<24>("POCKET LINE {} / {}", selected + 1, choices),
+                       phase == Phase::charge ? "RELEASE A / B BACK" : "UP/DOWN CHANGE LINE");
             }
             else
             {
-                label(footer, 120, 139, status, gold_text);
+                const char* message = game.notice == Notice::spotted ? "8 BALL RESPOTTED" :
+                                      game.breaking ? "YOUR BREAK" :
+                                      game.legal_target(8) ? "SINK THE 8 BALL" :
+                                      game.groups[local] == Group::open ? "OPEN TABLE" : "YOUR TURN";
+                status(message, phase == Phase::charge ? "RELEASE A / B BACK" : "");
             }
-            const char* controls = phase == Phase::charge ? "RELEASE A / B BACK" :
-                                   call >= 0 ? "SELECT POCKET / HOLD A" :
-                                   choices ? "UP/DN SHOTS  A POWER" : "HOLD A / L R FINE";
-            label(footer, 224, 151, controls, mint_text, Align::RIGHT);
-        }
-        if(human_aim || human_shot)
-        {
-            label(footer, 15, 151, "POWER", muted_text, Align::LEFT);
         }
     }
 
-    void show_balls(const Table& table, bool placing, Vec placement, bool valid)
+    bool update_camera(Vec cue, int angle, bool use_close_view, int pocket)
     {
-        for(int id = 0; id < 16; ++id)
+        if(use_close_view != close_view)
         {
-            const Ball& ball = table.balls[id];
-            if(ball.live || (! id && placing && valid))
+            close_view = use_close_view;
+            camera_angle = -1;
+            staged_angle = -1;
+            line.clear();
+            configure_projection(use_close_view);
+            if(! use_close_view)
             {
-                position(balls[id], ! id && placing ? placement : ball.pos);
-                balls[id].set_visible(true);
+                aim_table.hide();
+                aim_backdrop->set_visible(false);
+                background->set_visible(true);
             }
             else
             {
-                balls[id].set_visible(false);
+                line.close();
+                aim_table.show();
+                stick.set_visible(false);
+                close_stick.set_visible(false);
+                close_tail.set_visible(false);
+                called.set_visible(false);
             }
+        }
+        if(! use_close_view)
+        {
+            highlight_overhead_pocket(pocket);
+            return true;
+        }
+
+        // Stage the deck and its details on separate ticks, then commit the complete frame.
+        if(staged_angle >= 0)
+        {
+            if(! staged_finished)
+            {
+                aim_table.finish(staged_camera);
+                staged_finished = true;
+                return false;
+            }
+            camera = staged_camera;
+            camera_anchor = staged_anchor;
+            camera_angle = staged_angle;
+            ++camera_revision;
+            staged_angle = -1;
+            background->set_visible(false);
+            aim_backdrop->set_visible(true);
+            aim_table.commit();
+            return true;
+        }
+
+        if(angle != camera_angle || cue.x != camera_anchor.x || cue.y != camera_anchor.y)
+        {
+            staged_finished = false;
+            staged_camera = AimCamera(cue, angle);
+            staged_angle = angle;
+            staged_anchor = cue;
+            aim_table.draw(staged_camera);
+            return false;
+        }
+        return true;
+    }
+
+    int displayed_angle() const { return camera_angle; }
+
+    BN_CODE_IWRAM void show_balls(const Table& table, bool rolling, const Vec* placement, CueBallTint tint)
+    {
+        bool invalid = tint != CueBallTint::ivory;
+        if(tint != cue_tint)
+        {
+            if(invalid != (cue_tint != CueBallTint::ivory))
+            {
+                balls[0].set_z_order(invalid ? -1 : 0);
+                depth_order_count = -1;
+            }
+            balls[0].set_palette(tint == CueBallTint::bright_red ? placement_flash_palette :
+                                 ball_items[invalid ? 3 : 0]->palette_item());
+            cue_tint = tint;
+        }
+
+        int angle = close_view ? camera_angle : -1;
+        Vec heading = close_view ? direction(angle) : Vec{ 0, -direction_unit };
+        Vec screen_right{ -heading.y, heading.x };
+        CameraPitch pitch = close_view ? camera.pitch() : overview_pitch;
+        int far_to_near[16];
+        int visible_count = 0;
+        uint32_t pixels[sphere_words];
+        for(int id = 0; id < 16; ++id)
+        {
+            const Ball& ball = table.balls[id];
+            BallVisual& visual = sphere_pose[id];
+            bool show = false;
+            bool on_table = ball.live || (id == 0 && placement);
+            if(on_table)
+            {
+                Vec point = id == 0 && placement ? *placement : ball.pos;
+                Vec displacement = point - visual.previous;
+                bool changed = displacement.x || displacement.y;
+                if(rolling && visual.shown && changed)
+                {
+                    visual.spin.roll(displacement);
+                }
+                bool centered = close_view && id == 0 &&
+                                point.x == camera_anchor.x && point.y == camera_anchor.y;
+                bool camera_changed = camera_revision != visual.camera_revision && (! centered || ! visual.centered);
+                if(! visual.shown || changed || camera_changed || centered != visual.centered)
+                {
+                    visual.centered = centered;
+                    visual.projection = close_view ? camera.sphere(point) : project_sphere(point);
+                    visual.previous = point;
+                    visual.camera_revision = camera_revision;
+                    if(visual.projection.visible())
+                    {
+                        Vec pixel_center = visual.projection.pixel_center();
+                        position(balls[id], pixel_center.x, pixel_center.y);
+                        uint16_t next_tiles = visual.spin.draw(id, visual.projection, screen_right, pitch, pixels);
+                        unsigned tiles_to_update = next_tiles | visual.drawn_tiles;
+                        bool reload = false;
+                        while(tiles_to_update)
+                        {
+                            int tile = __builtin_ctz(tiles_to_update);
+                            tiles_to_update &= tiles_to_update - 1;
+                            bn::tile& destination = sphere_tiles[id][tile];
+                            const uint32_t* source = pixels + tile * 8;
+                            bool used = next_tiles & (1u << tile);
+                            for(int row = 0; row < 8; ++row)
+                            {
+                                uint32_t word = used ? source[row] : 0;
+                                if(destination.data[row] != word)
+                                {
+                                    destination.data[row] = word;
+                                    reload = true;
+                                }
+                            }
+                        }
+                        visual.drawn_tiles = next_tiles;
+                        if(reload)
+                        {
+                            bn::sprite_tiles_ptr tiles = balls[id].tiles();
+                            tiles.reload_tiles_ref();
+                        }
+
+                        if(close_view)
+                        {
+                            int zoom = std::clamp((visual.projection.radius_x * 5 + 3 * unit / 2) / (3 * unit) - 2, 0, 7);
+                            if(zoom != visual.zoom)
+                            {
+                                shadows[id].set_affine_mat(scales[zoom]);
+                                visual.zoom = zoom;
+                            }
+                        }
+                        // Keep the contact patch under the sphere's lower edge from either camera.
+                        Vec ground = close_view ? camera.screen(camera.local(point)) : project(point);
+                        const auto& sphere = visual.projection;
+                        ground.y = std::clamp(ground.y, sphere.center.y + sphere.radius_y * 2 / 3,
+                                             sphere.center.y + sphere.radius_y);
+                        visual.shadow_visible = shadow_fits_on_cloth(point) && inside_view(ground, 2);
+                        position(shadows[id], ground);
+                    }
+                }
+                show = visual.projection.visible();
+                if(show)
+                {
+                    int rank = visible_count++;
+                    while(rank && sphere_pose[far_to_near[rank - 1]].projection.distance_squared < visual.projection.distance_squared)
+                    {
+                        far_to_near[rank] = far_to_near[rank - 1];
+                        --rank;
+                    }
+                    far_to_near[rank] = id;
+                }
+            }
+            visual.shown = on_table;
+            balls[id].set_visible(show);
+            shadows[id].set_visible(show && visual.shadow_visible && (id != 0 || ! invalid));
+        }
+
+        if(visible_count != depth_order_count ||
+           std::memcmp(depth_order, far_to_near, visible_count * sizeof(int)) != 0)
+        {
+            for(int rank = 0; rank < visible_count; ++rank)
+            {
+                balls[far_to_near[rank]].put_above();
+            }
+            std::copy_n(far_to_near, visible_count, depth_order);
+            depth_order_count = visible_count;
         }
     }
 
@@ -538,25 +793,39 @@ public:
         }
     }
 
-    void placement_marker(Vec placement, bool valid)
-    {
-        clear_aim();
-        cursor.set_tiles(bn::sprite_items::placement.tiles_item(), valid ? 0 : 1);
-        position(cursor, placement);
-        cursor.set_visible(true);
-    }
-
     void clear_aim()
     {
         stick.set_visible(false);
-        ring.set_visible(false);
-        called.set_visible(false);
-        cursor.set_visible(false);
+        close_stick.set_visible(false);
+        close_tail.set_visible(false);
         line.clear();
     }
 
     void draw_cue(const Table& table, int angle, int pullback)
     {
+        if(close_view)
+        {
+            stick.set_visible(false);
+            int tip_row = camera.cue_tip_row((7 + pullback) * unit);
+            int length = std::clamp(view_bottom - tip_row, 1, 64);
+            if(length != close_stick_length)
+            {
+                close_stick_length = length;
+                close_stick.set_tiles(bn::sprite_items::close_cue.tiles_item(), std::min(length, 32) - 1);
+                if(length > 32)
+                {
+                    close_tail.set_tiles(bn::sprite_items::close_cue.tiles_item(), length - 1);
+                }
+            }
+            position(close_stick, 120, tip_row + 16);
+            position(close_tail, 120, tip_row + 48);
+            close_stick.set_visible(true);
+            close_tail.set_visible(length > 32);
+            return;
+        }
+
+        close_stick.set_visible(false);
+        close_tail.set_visible(false);
         if(bn::optional<CueSprite> pose = cue_sprite(table, angle, pullback))
         {
             position(stick, pose->center);
@@ -570,54 +839,58 @@ public:
         }
     }
 
-    void highlight_call(int pocket)
+    void trajectory(const EightBall& game, int angle)
     {
-        if(pocket < 0)
-        {
-            called.set_visible(false);
-            return;
-        }
-        position(called, pockets[pocket]);
-        called.set_visible(true);
-    }
-
-    void trajectory(const EightBall& game, int angle, int call)
-    {
-        ring.set_visible(false);
-        highlight_call(call);
-        cursor.set_visible(false);
         const Table& table = game.table;
         Vec cue = table.balls[0].pos;
-        Preview path = trace_aim(table, direction(angle));
-        Ray first = path.first;
-        if(length(first.end - cue) < 9 * unit)
+        Vec heading = direction(angle);
+        Ray first = table.trace(cue, heading, 0);
+        SphereProjection cue_ball = project_sphere(cue);
+        Vec ghost_center = project_sphere(first.end).center;
+        ghost_center = { (ghost_center.x & -unit) + unit / 2, (ghost_center.y & -unit) + unit / 2 };
+        bool show_ghost = first.pocket < 0 && (first.ball >= 0 || first.rail) &&
+                          length(ghost_center - cue_ball.center) >= cue_ball.radius_x + ghost_ball_radius - unit / 2 &&
+                          ghost_center.x >= ghost_ball_radius && ghost_center.x <= 240 * unit - ghost_ball_radius &&
+                          ghost_center.y >= ghost_ball_radius && ghost_center.y <= view_bottom * unit - ghost_ball_radius;
+        if(show_ghost)
         {
-            line.clear();
-            return;
+            SphereProjection nearby[15];
+            int count = 0;
+            for(int id = 1; id < 16; ++id)
+            {
+                const Ball& ball = table.balls[id];
+                if(ball.live && length(ball.pos - first.end) <= 12 * unit)
+                {
+                    nearby[count++] = project_sphere(ball.pos);
+                }
+            }
+            // The ball sprites can occlude a little of the ring and still leave it readable.
+            show_ghost = ! count || ShotLine::ghost_visible(ghost_center, nearby, count);
         }
+
+        Vec end = first.end;
+        if(! show_ghost && first.ball >= 0)
+        {
+            Vec offset = table.balls[first.ball].pos - end;
+            int across = (offset.y * heading.x - offset.x * heading.y) / direction_unit;
+            if(std::abs(across) < ball_height)
+            {
+                // Keep the line on the shot axis and let the sprite cover it at contact.
+                int along = (offset.x * heading.x + offset.y * heading.y) / direction_unit;
+                end += travel(heading, along);
+            }
+        }
+        LineInk ink = first.ball >= 0 && ! game.legal_target(first.ball) ? LineInk::warning : LineInk::cue;
+        aim_table.close();
+        line.show();
         line.begin();
-        Ray contact = path.bounced ? path.bank : first;
-        bool legal = ! path.hit || game.legal_target(contact.ball);
-        LineInk cue_ink = ! legal && ! path.bounced ? LineInk::warning : LineInk::cue;
-        line.draw(cue, first.end, cue_ink, 5, first.ball >= 0 ? 4 : 0);
-        if(path.bounced)
+        if(show_ghost)
         {
-            line.draw(first.end, contact.end, legal ? LineInk::bank : LineInk::warning,
-                      0, contact.ball >= 0 ? 4 : 0);
+            line.draw_to_ghost(cue_ball.center, ghost_center, ink);
         }
-        if(path.hit)
+        else
         {
-            if(length(contact.end - cue) >= 9 * unit)
-            {
-                move_ring(contact.end, legal);
-            }
-            if(path.object_moves)
-            {
-                LineSpan incoming{ cue, first.end };
-                Vec object = table.balls[contact.ball].pos;
-                line.draw(object, path.object.end, legal ? LineInk::object : LineInk::warning,
-                          5, 2, &incoming);
-            }
+            line.draw(cue_ball.center, project(end, ball_height), ink);
         }
         line.commit();
     }
@@ -625,20 +898,44 @@ public:
 private:
     bn::optional<bn::regular_bg_ptr> background;
     bn::optional<bn::regular_bg_ptr> panel;
+    bool pause_panel_open = false;
+    bn::optional<bn::regular_bg_ptr> match_hud;
+    bn::optional<bn::regular_bg_ptr> aim_backdrop;
     bn::sprite_text_generator text{ hud_font };
     bn::vector<bn::sprite_ptr, 16> hud;
     bn::vector<bn::sprite_ptr, 16> footer;
-    bn::vector<bn::sprite_ptr, 32> panel_text;
+    bn::vector<bn::sprite_ptr, 48> panel_text;
     bn::vector<bn::sprite_ptr, 16> balls;
+    bn::vector<bn::sprite_ptr, 16> shadows;
+    BallVisual sphere_pose[16];
+    int depth_order[16];
+    int depth_order_count = -1;
     bn::vector<bn::sprite_ptr, 14> group_balls;
     ShotLine line;
+    AimTable aim_table;
+    AimCamera camera;
+    AimCamera staged_camera;
+    Vec camera_anchor;
+    Vec staged_anchor;
+    int camera_angle = -1;
+    int staged_angle = -1;
+    bool full_hud = true;
+    bool close_view = false;
+    bool staged_finished = false;
+    unsigned camera_revision = 0;
+    bn::vector<bn::sprite_affine_mat_ptr, 8> scales;
     bn::vector<bn::sprite_ptr, meter_sections> bar;
     bn::vector<bn::sprite_ptr, 2> avatars;
     bn::sprite_ptr stick = make_sprite(bn::sprite_items::cue, -2);
-    bn::sprite_ptr ring = make_mark(circle, 1);
-    bn::sprite_ptr called = make_sprite(bn::sprite_items::pocket_marker, -1);
-    bn::sprite_ptr cursor = make_sprite(bn::sprite_items::placement, 1);
-    bn::sprite_ptr turn = make_mark(turn_diamond, 0);
+    bn::sprite_ptr close_stick = make_sprite(bn::sprite_items::close_cue, -2);
+    bn::sprite_ptr close_tail = make_sprite(bn::sprite_items::close_cue, -2);
+    int close_stick_length = 1;
+    int overhead_pocket = -1;
+    bn::sprite_ptr called = make_sprite(bn::sprite_items::called_pockets, 4);
+    CueBallTint cue_tint = CueBallTint::ivory;
+    bn::sprite_ptr active_border[2] = {
+        make_sprite(bn::sprite_items::active_player, 0), make_sprite(bn::sprite_items::active_player, 0, 1)
+    };
     int bar_filled = 0;
 
 
@@ -651,45 +948,96 @@ private:
         return result;
     }
 
-    static bn::sprite_ptr make_mark(Mark mark, int z)
-    {
-        return make_sprite(bn::sprite_items::marks, z, mark);
-    }
-
     void label(bn::ivector<bn::sprite_ptr>& target, int x, int y, const bn::string_view& value,
                const bn::sprite_palette_item& palette = ivory_text, Align align = Align::CENTER)
     {
         text.set_palette_item(palette);
         text.set_alignment(align);
-        bool on_panel = &target == &panel_text;
+        bool on_panel = &target == &panel_text || bool(match_hud);
         text.set_bg_priority(on_panel ? 0 : 2);
         text.generate(x - 120, y - 80, value, target);
     }
 
     void panel_actions(const char* primary, const char* secondary)
     {
-        label(panel_text, 75, 113, primary, gold_text);
-        label(panel_text, 165, 113, secondary, mint_text);
+        label(panel_text, 75, 130, primary, gold_text);
+        label(panel_text, 165, 130, secondary, mint_text);
     }
 
-    void open_panel()
+    void status(const bn::string_view& message, const bn::string_view& action = {})
+    {
+        text.set_z_order(-3);
+        label(footer, 9, 152, message, shadow_text, Align::LEFT);
+        if(! action.empty())
+        {
+            label(footer, 233, 152, action, shadow_text, Align::RIGHT);
+        }
+        text.set_z_order(-4);
+        label(footer, 8, 151, message, gold_text, Align::LEFT);
+        if(! action.empty())
+        {
+            label(footer, 232, 151, action, mint_text, Align::RIGHT);
+        }
+        text.set_z_order(0);
+    }
+
+    void open_panel(bool pause_layout = false)
     {
         panel_text.clear();
-        footer.clear();
-        show_power(false);
-        hide_playfield();
-        if(! panel)
+        if(aim_backdrop)
         {
-            panel = bn::regular_bg_items::panel.create_bg(8, 48);
+            hide_match_hud();
+        }
+        hide_playfield();
+        if(! panel || pause_panel_open != pause_layout)
+        {
+            panel.reset();
+            if(aim_backdrop)
+            {
+                line.close();
+            }
+            const auto& item = pause_layout ? bn::regular_bg_items::pause_panel : bn::regular_bg_items::panel;
+            panel = item.create_bg(8, 48);
             panel->set_priority(1);
+            pause_panel_open = pause_layout;
         }
     }
 
-    void move_ring(Vec point, bool legal)
+    void configure_projection(bool aiming)
     {
-        ring.set_tiles(bn::sprite_items::marks.tiles_item(), legal ? circle : foul_circle);
-        position(ring, point);
-        ring.set_visible(true);
+        ++camera_revision;
+        depth_order_count = -1;
+        for(int id = 0; id < 16; ++id)
+        {
+            sphere_pose[id].centered = false;
+            balls[id].set_bg_priority(aiming ? 1 : 2);
+            shadows[id].set_bg_priority(aiming ? 1 : 2);
+            sphere_pose[id].zoom = -1;
+            if(! aiming)
+            {
+                shadows[id].remove_affine_mat();
+            }
+        }
+    }
+
+    static bool inside_view(Vec point, int margin)
+    {
+        return point.x >= -margin * unit && point.x <= (239 + margin) * unit &&
+               point.y >= (view_top + margin) * unit && point.y <= (view_bottom - margin) * unit;
+    }
+
+    void highlight_overhead_pocket(int pocket)
+    {
+        if(pocket >= 0)
+        {
+            if(pocket != overhead_pocket)
+            {
+                called.set_tiles(bn::sprite_items::called_pockets.tiles_item(), pocket);
+                position(called, overview_pocket_centers[pocket][0], overview_pocket_centers[pocket][1]);
+                overhead_pocket = pocket;
+            }
+        }
+        called.set_visible(pocket >= 0);
     }
 
     void show_power(bool visible)
@@ -703,15 +1051,29 @@ private:
     void hide_playfield()
     {
         clear_aim();
+        called.set_visible(false);
+        depth_order_count = -1;
         for(bn::sprite_ptr& ball : balls)
         {
             ball.set_visible(false);
+        }
+        for(bn::sprite_ptr& shadow : shadows)
+        {
+            shadow.set_visible(false);
         }
     }
 
     void hide_sprites()
     {
         hide_playfield();
+        hide_match_hud();
+    }
+
+    void hide_match_hud()
+    {
+        match_hud.reset();
+        hud.clear();
+        footer.clear();
         for(bn::sprite_ptr& ball : group_balls)
         {
             ball.set_visible(false);
@@ -720,7 +1082,10 @@ private:
         {
             avatar.set_visible(false);
         }
-        turn.set_visible(false);
+        for(bn::sprite_ptr& edge : active_border)
+        {
+            edge.set_visible(false);
+        }
         show_power(false);
     }
 };
@@ -776,7 +1141,7 @@ public:
                         set_phase(Phase::aim);
                     }
                     screen = Screen::pause;
-                    view.controls(true, linked());
+                    view.pause(linked());
                     break;
                 }
                 play();
@@ -794,6 +1159,19 @@ public:
                 {
                     screen = Screen::concede;
                     view.concession(linked());
+                }
+                else if(bn::keypad::select_pressed())
+                {
+                    screen = Screen::pause_help;
+                    view.controls(true);
+                }
+                break;
+            case Screen::pause_help:
+                if(bn::keypad::a_pressed() || bn::keypad::b_pressed() || bn::keypad::select_pressed() ||
+                   bn::keypad::start_pressed())
+                {
+                    screen = Screen::pause;
+                    view.pause(linked());
                 }
                 break;
             case Screen::concede:
@@ -814,7 +1192,7 @@ public:
                 else if(bn::keypad::b_pressed())
                 {
                     screen = Screen::pause;
-                    view.controls(true, linked());
+                    view.pause(linked());
                 }
                 break;
             case Screen::result:
@@ -864,6 +1242,7 @@ private:
     Screen screen = Screen::lobby;
     Phase phase = Phase::aim;
     Vec placement;
+    Vec shot_origin;
     ShotPlanner planner;
     PocketSuggestions suggestions;
     Plan cpu_plan;
@@ -871,6 +1250,8 @@ private:
     unsigned frame = 0;
     int angle = 0;
     int last_guide = -1;
+    bool prefer_close_view = true;
+    bool full_match_hud = true;
     int last_pullback = 0;
     int aim_power = min_speed;
     int selected_line = -1;
@@ -922,7 +1303,7 @@ private:
         turn_index = 0;
         game.start(breaker);
         angle = 0;
-        view.show_room();
+        view.show_room(prefer_close_view);
         prepare_turn();
         draw_table();
         bn::sound_items::confirm.play(bn::fixed(0.45));
@@ -940,7 +1321,6 @@ private:
         {
             int change = records.add_result(won, rival().rating);
             int unlocked = records.profile().rival_index();
-            score();
             view.result(won, reason, records.profile(), change, unlocked > match_rival ? unlocked : -1);
         }
         bn::sound_items::confirm.play(bn::fixed(0.55));
@@ -949,7 +1329,7 @@ private:
     void score()
     {
         view.scoreboard(game, records.profile(), rival(), phase, finding_lines ? 0 : suggestions.size(), selected_line,
-                        linked() ? cable.player() : -1, called_pocket, call_cursor);
+                        linked() ? cable.player() : -1, called_pocket, call_cursor, full_match_hud);
     }
 
     void set_phase(Phase value)
@@ -1047,11 +1427,9 @@ private:
 
     void call_input()
     {
-        int column = call_cursor % 3;
-        int row = call_cursor / 3;
-        column = std::clamp(column + int(bn::keypad::right_pressed()) - int(bn::keypad::left_pressed()), 0, 2);
-        row = std::clamp(row + int(bn::keypad::down_pressed()) - int(bn::keypad::up_pressed()), 0, 1);
-        int next = row * 3 + column;
+        int horizontal = int(bn::keypad::right_pressed()) - int(bn::keypad::left_pressed());
+        int vertical = int(bn::keypad::down_pressed()) - int(bn::keypad::up_pressed());
+        int next = move_pocket_call(call_cursor, horizontal, vertical);
         if(next != call_cursor)
         {
             call_cursor = next;
@@ -1144,6 +1522,7 @@ private:
 
     void strike(int speed, int pocket)
     {
+        shot_origin = game.table.balls[0].pos;
         game.table.strike(direction(angle), speed, pocket);
         charge = speed;
         last_pots = 0;
@@ -1187,9 +1566,14 @@ private:
         int pace = hold > 16 ? 2 * unit : unit;
         placement.x = std::clamp(placement.x + x * pace, left, right);
         placement.y = std::clamp(placement.y + y * pace, top, bottom);
-        if(bn::keypad::a_pressed() && game.table.can_place(placement))
+        if(bn::keypad::a_pressed())
         {
-            // Link packets use whole-pixel positions. The placement cursor moves on that grid.
+            if(! game.table.can_place(placement))
+            {
+                bn::sound_items::reject.play(bn::fixed(0.45));
+                return;
+            }
+            // Link packets use whole-pixel positions. The placement preview moves on that grid.
             game.table.place_cue(placement);
             link_placement = placement;
             placed_for_link = true;
@@ -1238,12 +1622,22 @@ private:
     void play()
     {
         ++timer;
+        if(bn::keypad::l_held() && bn::keypad::r_held() && (bn::keypad::l_pressed() || bn::keypad::r_pressed()))
+        {
+            full_match_hud = ! full_match_hud;
+            score();
+        }
+        if(phase != Phase::place && phase != Phase::call && bn::keypad::select_pressed())
+        {
+            prefer_close_view = ! prefer_close_view;
+            last_guide = -1;
+        }
         switch(phase)
         {
             case Phase::aim:
                 guide_input();
                 steer();
-                if(called_pocket >= 0 && bn::keypad::select_pressed())
+                if(called_pocket >= 0 && bn::keypad::b_pressed())
                 {
                     call_cursor = called_pocket;
                     set_phase(Phase::call);
@@ -1267,6 +1661,10 @@ private:
                 }
                 else if(bn::keypad::a_released())
                 {
+                    if(prefer_close_view && last_guide >= 0)
+                    {
+                        angle = last_guide;
+                    }
                     local_shot(charge);
                 }
                 else
@@ -1326,43 +1724,83 @@ private:
     void draw_table()
     {
         bool placing = phase == Phase::place;
-        bool valid_placement = placing && game.table.can_place(placement);
-        view.show_balls(game.table, placing, placement, valid_placement);
-        view.power(phase == Phase::aim ? 0 : charge);
+        bool use_close_view = ! placing && phase != Phase::call && prefer_close_view;
+        Vec focus = game.table.balls[0].pos;
+        int heading = angle;
+        if(placing)
+        {
+            view.clear_aim();
+        }
+        else if(use_close_view)
+        {
+            switch(phase)
+            {
+                case Phase::rolling:
+                    focus = shot_origin;
+                    break;
+                case Phase::cpu_wait:
+                case Phase::remote:
+                    heading = direction_angle(px(120, 84) - focus);
+                    break;
+                default:
+                    break;
+            }
+        }
+        bool show_charge = phase == Phase::charge || (phase == Phase::rolling && game.player == local_player());
+        view.power(show_charge ? charge : 0);
+        int pocket = phase == Phase::call ? call_cursor :
+                     phase == Phase::cpu_aim ? cpu_plan.pocket :
+                     phase == Phase::rolling ? game.table.shot.called_pocket :
+                     phase == Phase::aim || phase == Phase::charge ? called_pocket : -1;
+        if(! view.update_camera(focus, heading, use_close_view, pocket))
+        {
+            return;
+        }
+        CueBallTint tint = CueBallTint::ivory;
+        if(placing && ! game.table.can_place(placement))
+        {
+            tint = (timer / 10) % 2 ? CueBallTint::red : CueBallTint::bright_red;
+        }
+        view.show_balls(game.table, phase == Phase::rolling, placing ? &placement : nullptr, tint);
         switch(phase)
         {
             case Phase::aim:
             case Phase::charge:
             {
-                int pullback = phase == Phase::charge ? 1 + (charge - aim_power) * 10 / (max_speed - min_speed) : 0;
-                bool aim_changed = angle != last_guide;
+                int pullback = 0;
+                if(phase == Phase::charge)
+                {
+                    int travel_range = use_close_view ? 11 : 26;
+                    int remaining = max_speed - aim_power;
+                    pullback = 1 + (remaining ? (charge - aim_power) * travel_range / remaining :
+                                                std::min(timer, 32) * travel_range / 32);
+                }
+                int displayed = use_close_view ? view.displayed_angle() : angle;
+                bool aim_changed = displayed != last_guide;
                 if(aim_changed)
                 {
-                    view.trajectory(game, angle, called_pocket);
-                    last_guide = angle;
+                    if(! use_close_view)
+                    {
+                        view.trajectory(game, displayed);
+                    }
+                    last_guide = displayed;
                 }
                 if(aim_changed || pullback != last_pullback)
                 {
-                    view.draw_cue(game.table, angle, pullback);
+                    view.draw_cue(game.table, displayed, pullback);
                     last_pullback = pullback;
                 }
                 break;
             }
             case Phase::call:
                 view.clear_aim();
-                view.highlight_call(call_cursor);
-                break;
-            case Phase::place:
-                view.placement_marker(placement, valid_placement);
                 break;
             case Phase::cpu_aim:
                 view.clear_aim();
-                view.draw_cue(game.table, angle, std::max(0, timer - 12) / 2);
-                view.highlight_call(cpu_plan.pocket);
+                view.draw_cue(game.table, angle, std::clamp((timer - 12) / 2, 0, 12));
                 break;
             case Phase::rolling:
                 view.clear_aim();
-                view.highlight_call(game.table.shot.called_pocket);
                 break;
             case Phase::cpu_wait:
             case Phase::remote:
@@ -1378,7 +1816,7 @@ private:
 int main()
 {
     bn::core::init();
-    Game game;
+    BN_DATA_EWRAM_BSS static Game game;
     while(true)
     {
         game.tick();

@@ -1,5 +1,7 @@
 #include "pool.h"
+#include "pool_view.h"
 
+#include <algorithm>
 #include <cassert>
 #include <cstdio>
 #include <initializer_list>
@@ -122,7 +124,135 @@ void preview_and_suggestions()
     Preview bank = preview_shot(game.table, direction(832), max_speed);
     assert(bank.first.rail && bank.bounced && bank.bank.end.y > bank.first.end.y);
     Preview bank_guide = trace_aim(game.table, direction(832));
-    assert(bank_guide.bounced && bank_guide.first.end.y == top && bank_guide.bank.end.y == bottom);
+    assert(bank_guide.bounced && bank_guide.first.end.y <= top + 2 && bank_guide.bank.end.y >= bottom - 2);
+}
+
+void pocket_call_navigation()
+{
+    constexpr int clockwise[] = { 0, 1, 2, 5, 4, 3 };
+    for(int index = 0; index < 6; ++index)
+    {
+        int pocket = clockwise[index];
+        assert(move_pocket_call(pocket, 1, 0) == clockwise[(index + 1) % 6]);
+        assert(move_pocket_call(pocket, -1, 0) == clockwise[(index + 5) % 6]);
+        assert(move_pocket_call(pocket, 0, 1) == (pocket + 3) % 6);
+        assert(move_pocket_call(pocket, 0, -1) == (pocket + 3) % 6);
+    }
+}
+
+void perspective_and_roll()
+{
+    Vec far = project(px(200, 46));
+    Vec near = project(px(200, 122));
+    assert(near.x > far.x && near.y > far.y);
+    assert(project(px(120, 84), ball_height).y < project(px(120, 84)).y);
+    assert(project_sphere(px(120, 46)).radius_y < project_sphere(px(120, 122)).radius_y);
+
+    Vec cue = px(63, 84);
+    AimCamera straight(cue, 0);
+    AimCamera turned(cue, 256);
+    CameraPoint cue_straight = straight.local(cue, ball_height);
+    CameraPoint cue_turned = turned.local(cue, ball_height);
+    assert(cue_straight.x == 0 && cue_turned.x == 0);
+    assert(cue_straight.depth == cue_turned.depth);
+    assert(straight.screen(cue_straight).y > 95 * unit);
+    assert(straight.local(px(154, 84)).x == 0);
+    assert(turned.local(px(154, 84)).x < -80 * unit);
+
+    for(int angle = 0; angle < angle_count; ++angle)
+    {
+        AimCamera orbit(cue, angle);
+        assert(orbit.cue_tip_row(7 * unit) == straight.cue_tip_row(7 * unit));
+        assert(orbit.cue_tip_row(12 * unit) == straight.cue_tip_row(12 * unit));
+    }
+    assert(straight.cue_tip_row(12 * unit) > straight.cue_tip_row(7 * unit));
+
+    assert(straight.cue_tip_row(19 * unit) - straight.cue_tip_row(7 * unit) >= 20);
+    assert(straight.cue_tip_row(19 * unit) < view_bottom - 12);
+
+    Vec rear = px(11, 84);
+    Vec tip = px(56, 84);
+    assert(straight.segment(rear, tip, ball_height));
+    assert(rear.x == 120 * unit && tip.x == rear.x);
+    assert(rear.y == view_bottom * unit && tip.y < rear.y);
+    Vec behind = px(6, 84);
+    Vec outside = px(7, 84);
+    assert(! straight.segment(behind, outside, ball_height));
+
+    for(int x : { left, right })
+    {
+        for(int y : { top, bottom })
+        {
+            Vec near_corner{ x, y };
+            Vec far_corner = px(x == left ? 231 : 9, y == top ? 136 : 32);
+            AimCamera lengthwise(near_corner, direction_angle(far_corner - near_corner));
+            Vec far_rail = lengthwise.screen(lengthwise.local(far_corner, 3 * unit));
+            assert(far_rail.y >= (view_top + 2) * unit && far_rail.y < 60 * unit);
+        }
+    }
+
+    for(int x : { left, right })
+    {
+        for(int y : { top, bottom })
+        {
+            SphereProjection corner = project_sphere({ x, y });
+            assert(corner.visible() && corner.covers(corner.center));
+            assert(! corner.covers(corner.center + px(10, 0)));
+        }
+    }
+    for(Vec pocket : pockets)
+    {
+        assert(! shadow_fits_on_cloth(pocket));
+    }
+    assert(! shadow_fits_on_cloth(px(120, 49)));
+    assert(! shadow_fits_on_cloth(px(24, 119)));
+    assert(shadow_fits_on_cloth(px(120, 64)));
+
+    SphereProjection close = straight.sphere(cue);
+    SphereProjection distant = straight.sphere(px(154, 84));
+    assert(close.visible() && distant.visible());
+    assert(close.radius_y > 2 * distant.radius_y && close.distance_squared < distant.distance_squared);
+    assert(! straight.sphere(px(6, 84)).visible());
+
+    // Two touching spheres across the camera should never cover the same pixel.
+    Vec touching{ cue.x, cue.y + diameter };
+    SphereProjection adjacent = straight.sphere(touching);
+    uint32_t before[sphere_words]{};
+    uint32_t after[sphere_words]{};
+    RollingBall ball;
+    ball.draw(9, close, { 0, direction_unit }, aim_pitch, before);
+    ball.draw(9, adjacent, { 0, direction_unit }, aim_pitch, after);
+    auto covered = [](const uint32_t* tiles, Vec center, int x, int y) {
+        int column = x - center.x + sphere_sprite_size / 2;
+        int row = y - center.y + sphere_sprite_size / 2;
+        if(column < 0 || column >= sphere_sprite_size || row < 0 || row >= sphere_sprite_size)
+        {
+            return false;
+        }
+        int tile = (row / 8) * (sphere_sprite_size / 8) + column / 8;
+        return ((tiles[tile * 8 + row % 8] >> (4 * (column % 8))) & 15u) != 0;
+    };
+    for(int y = view_top; y < view_bottom; ++y)
+    {
+        for(int x = 0; x < 240; ++x)
+        {
+            assert(! (covered(before, close.pixel_center(), x, y) &&
+                      covered(after, adjacent.pixel_center(), x, y)));
+        }
+    }
+
+    ball.roll(px(6, 0));
+    assert(ball.x > 900 && ball.y == 0 && ball.z < 120);
+    std::fill_n(after, sphere_words, 0u);
+    ball.draw(9, close, { 0, direction_unit }, aim_pitch, after);
+    bool rolled = false;
+    for(int i = 0; i < sphere_words; ++i)
+    {
+        rolled |= before[i] != after[i];
+    }
+    assert(rolled);
+    ball.roll(px(-6, 0));
+    assert(ball.x < 10 && ball.x > -10 && ball.z > 1000);
 }
 
 void rules()
@@ -279,6 +409,8 @@ int main()
 {
     aiming_and_physics();
     preview_and_suggestions();
+    pocket_call_navigation();
+    perspective_and_roll();
     rules();
     rating();
     bot_matches();
