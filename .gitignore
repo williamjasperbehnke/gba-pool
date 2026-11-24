@@ -1,6 +1,7 @@
 /build/
 /break_room.elf
 *.sav
+!/break_room_unlocked.sav
 *.ss[0-9]
 __pycache__/
 .DS_Store

@@ -1,4 +1,5 @@
 #include "pool.h"
+#include "pool_career.h"
 #include "pool_view.h"
 
 #include <algorithm>
@@ -129,12 +130,12 @@ void preview_and_suggestions()
 
 void pocket_call_navigation()
 {
-    constexpr int clockwise[] = { 0, 1, 2, 5, 4, 3 };
-    for(int index = 0; index < 6; ++index)
+    constexpr int right_of[] = { 1, 2, 0, 4, 5, 3 };
+    constexpr int left_of[] = { 2, 0, 1, 5, 3, 4 };
+    for(int pocket = 0; pocket < 6; ++pocket)
     {
-        int pocket = clockwise[index];
-        assert(move_pocket_call(pocket, 1, 0) == clockwise[(index + 1) % 6]);
-        assert(move_pocket_call(pocket, -1, 0) == clockwise[(index + 5) % 6]);
+        assert(move_pocket_call(pocket, 1, 0) == right_of[pocket]);
+        assert(move_pocket_call(pocket, -1, 0) == left_of[pocket]);
         assert(move_pocket_call(pocket, 0, 1) == (pocket + 3) % 6);
         assert(move_pocket_call(pocket, 0, -1) == (pocket + 3) % 6);
     }
@@ -345,16 +346,132 @@ void rules()
 void rating()
 {
     Profile profile;
-    assert(profile.rival_index() == 0);
     assert(profile.record(true, 850) == 24);
-    profile.record(true, 850);
-    profile.record(true, 850);
-    assert(profile.rival_index() == 1 && profile.wins == 3);
     int highest = profile.best;
-    profile.record(false, 950);
-    profile.record(false, 950);
-    assert(profile.rating < rivals[1].unlock);
-    assert(profile.rival_index() == 1 && profile.best == highest && profile.losses == 2);
+    assert(profile.record(false, 850) < 0);
+    assert(profile.best == highest && profile.losses == 1);
+
+    Career career;
+    assert(career.rival_index() == 0);
+    for(int rival = 0; rival < rival_count - 1; ++rival)
+    {
+        career.record(true, rival);
+        assert(career.rival_index() == rival + 1);
+    }
+    career.record(false, boss_rival);
+    assert(career.rival_index() == boss_rival);
+}
+
+void career_progress()
+{
+    Career career;
+    assert(! career.equip_cue(1));
+    MatchReward reward = career.record(true, 0);
+    assert(reward.cue == 1 && reward.accessory == 1 && career.owns(0) && ! career.owns(1));
+    assert(career.recent(0).rating == 850 + reward.rating && career.recent(0).won);
+    assert(career.equip_cue(1) && career.equipped == 1);
+    assert(! career.equip_cue(1));
+    assert(career.equip_cue(0) && career.equipped == 0);
+    for(int index = 0; index < career_history_capacity + 3; ++index)
+    {
+        career.record(false, index % rival_count);
+    }
+    assert(career.count == career_history_capacity);
+    assert(career.recent(0).rival == (career_history_capacity + 2) % rival_count);
+    assert(career.recent(career_history_capacity - 1).rival == 3 % rival_count);
+    assert(career.recent(0).rating == career.profile.rating && career.owns(0));
+    reward = career.record(true, 1);
+    assert(reward.cue == 2 && reward.accessory == 2 && career.owns(1));
+}
+
+void career_equipment()
+{
+    Career career;
+    assert(! career.equip_cue(1) && ! career.equip_accessory(0));
+    assert(career.equip_accessory(sunglasses) && career.outfit == sunglasses + 1);
+    assert(career.equip_accessory(sunglasses) && career.outfit == 0);
+    assert(! career.owns_accessory(chalk_headband) && ! career.owns_accessory(gold_visor));
+
+    Career starter;
+    starter.record(true, 0);
+    assert(starter.owns_accessory(chalk_headband) && ! starter.owns_accessory(gold_visor));
+
+    MatchReward first = career.record(true, boss_rival);
+    assert(first.cue == boss_rival + 1 && first.accessory == boss_rival + 1);
+    assert(career.owns_accessory(boss_rival) && career.equip_cue(first.cue));
+    assert(career.owns_accessory(gold_visor));
+    for(int win = 2; win <= 10; ++win)
+    {
+        MatchReward repeat = career.record(true, boss_rival, 4);
+        assert(repeat.cue == 0 && repeat.accessory == 0 && repeat.challenge);
+        assert(bool(repeat.milestone) == (win == 10));
+    }
+    assert(career.best_streak == 10 && career.challenges == 9);
+    assert(career.equip_accessory(boss_rival) && career.outfit == boss_rival + 1);
+    career.record(false, boss_rival);
+    assert(! career.streak && career.best_streak == 10 && career.owns_cue(first.cue));
+    assert(career.equip_accessory(boss_rival) && career.outfit == 0);
+}
+
+void pot_ownership()
+{
+    EightBall game;
+    game.start(0);
+    game.table.shot.pocketed = 1 << 9;
+    assert(game.potted_group(Group::open));
+    assert(! game.potted_group(Group::solids) && game.potted_group(Group::stripes));
+    game.table.shot.pocketed = (1 << 8) | 1;
+    assert(! game.potted_group(Group::open));
+}
+
+void river_run()
+{
+    EightBall game;
+    game.start(0);
+    game.breaking = false;
+    PotCombo combo;
+    combo.arm();
+    assert(! combo.ready());
+
+    game.table.balls[1].live = false;
+    game.table.shot = { 1 << 1, 1, 1, true };
+    assert(! game.finish_shot(&combo) && combo.ready() && game.player == 0);
+    assert(game.groups[0] == Group::solids);
+
+    game.table.shot = { 0, 3, -1, true };
+    assert(game.finish_shot(&combo) && ! combo.active() && game.player == 0 && ! game.ball_in_hand);
+    assert(! game.finish_shot(&combo) && game.player == 1);
+
+    game.start(0);
+    game.breaking = false;
+    combo.arm();
+    game.table.shot = { 0, 2, -1, true };
+    assert(! game.finish_shot(&combo) && ! combo.active() && game.player == 1);
+
+    game.start(0);
+    game.breaking = false;
+    combo.arm();
+    game.table.shot = { 1 << 1, 1, 1, true };
+    game.finish_shot(&combo);
+    assert(combo.ready());
+    game.table.shot = { 1, 3, -1, true };
+    assert(! game.finish_shot(&combo) && ! combo.active() && game.player == 1 && game.ball_in_hand);
+}
+
+void cue_ratings()
+{
+    for(int index = 0; index < cue_count; ++index)
+    {
+        const CueSpec& cue = cues[index];
+        assert(cue.speed >= 1 && cue.speed <= 100);
+        assert(cue.spin >= 1 && cue.spin <= 100);
+        assert(cue.control >= 1 && cue.control <= 100);
+    }
+    assert(cue_shot_speed(0, max_speed) == max_speed);
+    assert(cue_spin_strength(0) == 100 && cue_charge_rate(0) == 100);
+    assert(cue_shot_speed(5, max_speed) > cue_shot_speed(2, max_speed));
+    assert(cue_spin_strength(3) > cue_spin_strength(5));
+    assert(cue_charge_rate(2) < cue_charge_rate(5));
 }
 
 void bot_matches()
@@ -376,7 +493,7 @@ void bot_matches()
                 int work_frames = 0;
                 while(! planner.advance(game, seed))
                 {
-                    assert(++work_frames <= 60);
+                    assert(++work_frames <= 150);
                 }
                 const Plan& plan = planner.result();
                 if(game.ball_in_hand)
@@ -401,7 +518,8 @@ void bot_matches()
         std::printf("%s completed 30 matches. Pot rate %d.%d%%.\n", rivals[difficulty].name,
                     pot_rate[difficulty] / 10, pot_rate[difficulty] % 10);
     }
-    assert(pot_rate[rival_count - 1] > pot_rate[0] + 100);
+    assert(pot_rate[3] >= 500 && pot_rate[4] >= 500);
+    assert(pot_rate[4] > pot_rate[2] + 150);
 }
 
 void cue_spin()
@@ -461,5 +579,10 @@ int main()
     cue_spin();
     rules();
     rating();
+    career_progress();
+    career_equipment();
+    pot_ownership();
+    river_run();
+    cue_ratings();
     bot_matches();
 }

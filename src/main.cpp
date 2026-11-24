@@ -46,18 +46,29 @@
 #include "bn_sprite_items_ball_14.h"
 #include "bn_sprite_items_ball_15.h"
 #include "bn_sprite_items_avatars.h"
+#include "bn_sprite_items_cosmetic_avatars.h"
+#include "bn_sprite_items_wardrobe_portraits.h"
 #include "bn_sprite_items_cue.h"
+#include "bn_sprite_items_cue_previews.h"
+#include "bn_sprite_items_gear_frame.h"
 #include "bn_sprite_items_close_cue.h"
 #include "bn_sprite_items_hud_font.h"
 #include "bn_sprite_items_marks.h"
 #include "bn_sprite_items_meter.h"
+#include "bn_sprite_items_rival_portraits.h"
+#include "bn_sprite_items_rival_icons.h"
+#include "bn_sprite_items_finn_portrait.h"
+#include "bn_sprite_items_finn_icon.h"
 #include "bn_sprite_items_spin_ball.h"
 #include "bn_sprite_items_spin_dot.h"
+#include "bn_sprite_items_taunt_chip.h"
 #include "bn_sprite_items_active_player.h"
 #include "bn_sprite_items_called_pockets.h"
 
 #include "font_widths.h"
 #include "pool.h"
+#include "pool_career.h"
+#include "pool_banter.h"
 #include "pocket_art.h"
 #include "pool_cable.h"
 #include "pool_view.h"
@@ -94,6 +105,8 @@ constexpr auto placement_red_colors = placement_colors(false);
 constexpr bn::sprite_palette_item placement_flash_palette(placement_flash_colors, bn::bpp_mode::BPP_4);
 constexpr bn::sprite_palette_item placement_red_palette(placement_red_colors, bn::bpp_mode::BPP_4);
 
+constexpr int matches_per_page = 5;
+
 constexpr bn::sprite_font hud_font(bn::sprite_items::hud_font, {}, font_widths, 2);
 constexpr auto text_colors(bn::color ink)
 {
@@ -114,75 +127,165 @@ constexpr auto& ivory_text = bn::sprite_items::hud_font.palette_item();
 using Align = bn::sprite_text_generator::alignment_type;
 
 constexpr int meter_sections = 5;
-constexpr int cue_length = 54;
+constexpr int cue_length = 64;
 constexpr int break_power = 340;
-constexpr int rating_magic = 0x38425231;
 
 constexpr const char* pocket_names[] = {
     "TOP LEFT", "TOP MIDDLE", "TOP RIGHT", "BOTTOM LEFT", "BOTTOM MIDDLE", "BOTTOM RIGHT"
 };
-enum class Screen { lobby, match, help, pause, pause_help, concede, result, link_wait, link_lost, link_leaving };
+enum class Screen { lobby, roster, record, gear, collection, match, help, pause, pause_help, concede, result, link_wait, link_lost, link_leaving };
+enum class RecordPage { rating, history, badges };
+
 enum class Phase { aim, charge, call, place, rolling, cpu_wait, cpu_aim, remote, link_send };
 
-struct SaveSlot
+struct CareerSlot
 {
-    uint32_t magic = rating_magic;
+    static constexpr uint32_t id = 0x38435236;
+    uint32_t magic = id;
     uint32_t sequence = 0;
-    Profile profile;
+    Career career;
     uint32_t checksum = 0;
 
     uint32_t calculate() const
     {
         uint32_t hash = 0x811c9dc5u;
+        auto mix = [&](uint32_t value) { hash = (hash ^ value) * 0x01000193u; };
+        const Profile& profile = career.profile;
         for(uint32_t value : { magic, sequence, uint32_t(profile.rating), uint32_t(profile.best),
                                uint32_t(profile.wins), uint32_t(profile.losses) })
         {
-            hash = (hash ^ value) * 0x01000193u;
+            mix(value);
+        }
+        for(unsigned value : { unsigned(career.defeated), unsigned(career.equipped), unsigned(career.count),
+                              unsigned(career.next), unsigned(career.reserved), unsigned(career.outfit),
+                              unsigned(career.streak), unsigned(career.best_streak), unsigned(career.challenges) })
+        {
+            mix(value);
+        }
+        for(uint8_t wins : career.wins_by_rival)
+        {
+            mix(wins);
+        }
+        for(const CareerMatch& match : career.history)
+        {
+            mix(uint32_t(match.rating));
+            mix(uint32_t(match.change));
+            mix(match.rival);
+            mix(match.won);
         }
         return hash;
     }
 
     bool valid() const
     {
-        return magic == rating_magic && checksum == calculate() &&
-               profile.rating >= 100 && profile.rating <= profile.best && profile.best <= 2400 &&
-               profile.wins >= 0 && profile.wins <= 9999 && profile.losses >= 0 && profile.losses <= 9999;
+        const Profile& profile = career.profile;
+        if(magic != id || checksum != calculate() || career.reserved ||
+           profile.rating < 100 || profile.rating > profile.best || profile.best > 2400 ||
+           profile.wins < 0 || profile.wins > 9999 || profile.losses < 0 || profile.losses > 9999 ||
+           career.count > career_history_capacity || career.next >= career_history_capacity ||
+           (career.count < career_history_capacity && career.next != career.count) ||
+           career.defeated >= (1 << rival_count) ||
+           career.equipped >= cue_count || ! career.owns_cue(career.equipped) ||
+           career.outfit > accessory_count || (career.outfit && ! career.owns_accessory(career.outfit - 1)) ||
+           career.streak > career.best_streak || career.best_streak > profile.wins || career.challenges > 9999)
+        {
+            return false;
+        }
+        for(int age = 0; age < career.count; ++age)
+        {
+            const CareerMatch& match = career.recent(age);
+            if(match.rating < 100 || match.rating > profile.best || match.rival >= rival_count || match.won > 1 ||
+               match.change < -48 || match.change > 48)
+            {
+                return false;
+            }
+        }
+        return true;
     }
 };
+
+static_assert(sizeof(CareerSlot) == 168);
 
 class Records
 {
 public:
     Records()
     {
-        SaveSlot slots[2];
-        for(int i = 0; i < 2; ++i)
+        for(int index = 0; index < 2; ++index)
         {
-            bn::sram::read_offset(slots[i], i * int(sizeof(SaveSlot)));
-            if(slots[i].valid() && (active < 0 || slots[i].sequence > record.sequence))
+            CareerSlot slot;
+            bn::sram::read_offset(slot, offset(index));
+            if(slot.valid() && (active < 0 || slot.sequence > record.sequence))
             {
-                active = i;
-                record = slots[i];
+                active = index;
+                record = slot;
             }
         }
     }
 
-    const Profile& profile() const { return record.profile; }
+    const Profile& profile() const { return career().profile; }
+    const Career& career() const { return record.career; }
 
-    int add_result(bool won, int opponent_rating)
+    MatchReward add_result(bool won, int rival, int shots)
     {
-        int change = record.profile.record(won, opponent_rating);
-        ++record.sequence;
-        record.checksum = record.calculate();
-        active = active == 0 ? 1 : 0;
-        bn::sram::write_offset(record, active * int(sizeof(SaveSlot)));
-        return change;
+        MatchReward reward = record.career.record(won, rival, shots);
+        save();
+        return reward;
+    }
+
+    bool collection_action(int item, bool clothing)
+    {
+        bool changed = clothing ? record.career.equip_accessory(item) : record.career.equip_cue(item);
+        if(changed)
+        {
+            save();
+        }
+        return changed;
     }
 
 private:
-    SaveSlot record;
+    CareerSlot record;
     int active = -1;
+
+    static constexpr int offset(int index) { return 2048 + index * int(sizeof(CareerSlot)); }
+
+    void save()
+    {
+        ++record.sequence;
+        record.checksum = record.calculate();
+        active = active == 0 ? 1 : 0;
+        bn::sram::write_offset(record, offset(active));
+    }
 };
+
+bn::array<bn::color, 16> cue_colors(int style)
+{
+    const auto& original = bn::sprite_items::cue.palette_item();
+    bn::array<bn::color, 16> colors;
+    std::copy_n(original.colors_ref().data(), 16, colors.data());
+    if(style)
+    {
+        constexpr bn::color accents[] = {
+            { 16, 21, 8 }, { 7, 22, 27 }, { 31, 13, 6 }, { 24, 11, 21 }, { 8, 24, 22 }
+        };
+        static_assert(sizeof(accents) / sizeof(*accents) == cue_count - 1);
+        bn::color color = accents[style - 1];
+        colors[3] = bn::color((color.red() * 2 + 9) / 4, (color.green() * 2 + 5) / 4,
+                              (color.blue() * 2 + 3) / 4);
+        colors[4] = color;
+        colors[6] = bn::color((color.red() + 26) / 2, (color.green() + 20) / 2, (color.blue() + 13) / 2);
+        colors[11] = color;
+        colors[12] = bn::color(color.red() / 2, color.green() / 2, color.blue() / 2);
+        if(style == 5)
+        {
+            colors[3] = color;
+            colors[5] = bn::color(31, 29, 22);
+            colors[6] = color;
+            colors[7] = bn::color(23, 26, 23);
+        }
+    }
+    return colors;
+}
 
 void position(bn::sprite_ptr& sprite, int x, int y)
 {
@@ -206,18 +309,47 @@ const char* foul_label(Notice notice)
     }
 }
 
+constexpr int aim_repeat_delay = 7;
+constexpr int aim_ramp_interval = 4;
+constexpr int max_aim_step = 8;
+constexpr int aim_full_speed = aim_repeat_delay + (max_aim_step - 1) * aim_ramp_interval;
+
 int aim_step(int held_frames)
 {
     if(held_frames == 0)
     {
         return 1;
     }
-    if(held_frames < 9)
+    if(held_frames < aim_repeat_delay)
     {
         return 0;
     }
-    return std::min(4, 1 + (held_frames - 9) / 11);
+    return 1 + (held_frames - aim_repeat_delay) / aim_ramp_interval;
 }
+
+class DirectionRepeat
+{
+public:
+    int step(int held)
+    {
+        if(held != direction)
+        {
+            direction = held;
+            countdown = 12;
+            return direction;
+        }
+        if(direction && --countdown == 0)
+        {
+            countdown = 5;
+            return direction;
+        }
+        return 0;
+    }
+
+private:
+    int direction = 0;
+    int countdown = 0;
+};
 
 constexpr int angle_delta(int target, int current)
 {
@@ -226,6 +358,47 @@ constexpr int angle_delta(int target, int current)
 }
 
 BN_DATA_EWRAM_BSS bn::tile sphere_tiles[16][sphere_words / 8];
+constexpr int rating_plot_width = 168;
+constexpr int rating_plot_left = 36;
+constexpr int rating_plot_slices = (rating_plot_width + 63) / 64;
+BN_DATA_EWRAM_BSS bn::tile rating_tiles[rating_plot_slices][64];
+BN_DATA_EWRAM_BSS bn::tile cue_stat_tiles[32];
+
+void rating_pixel(int x, int y, unsigned color)
+{
+    bn::tile& tile = rating_tiles[x >> 6][(y >> 3) * 8 + ((x & 63) >> 3)];
+    int shift = (x & 7) * 4;
+    uint32_t& row = tile.data[y & 7];
+    row = (row & ~(15u << shift)) | (color << shift);
+}
+
+void rating_segment(Vec from, Vec to)
+{
+    int width = to.x - from.x;
+    int rise = std::abs(to.y - from.y);
+    int step = from.y < to.y ? 1 : -1;
+    int error = width - rise;
+    while(true)
+    {
+        rating_pixel(from.x, from.y, 8);
+        if(from.x == to.x && from.y == to.y)
+        {
+            return;
+        }
+        int twice = 2 * error;
+        if(twice > -rise)
+        {
+            error -= rise;
+            ++from.x;
+        }
+        if(twice < width)
+        {
+            error += width;
+            from.y += step;
+        }
+    }
+}
+
 
 struct BallVisual
 {
@@ -296,24 +469,6 @@ public:
             scale.set_scale(bn::fixed(2 + i) / 5);
             scales.push_back(std::move(scale));
         }
-        for(int id = 0; id < 16; ++id)
-        {
-            bn::sprite_tiles_item tiles(sphere_tiles[id], bn::bpp_mode::BPP_4);
-            bn::sprite_item sphere(bn::sprite_shape_size(sphere_sprite_size, sphere_sprite_size),
-                                   tiles, ball_items[id]->palette_item());
-            balls.push_back(make_sprite(sphere, 0));
-            shadows.push_back(make_sprite(bn::sprite_items::marks, 6));
-        }
-        for(int id = 0; id < 14; ++id)
-        {
-            group_balls.push_back(make_sprite(*ball_items[1], 0));
-            group_balls.back().set_bg_priority(0);
-        }
-        for(int i = 0; i < 2; ++i)
-        {
-            avatars.push_back(make_sprite(bn::sprite_items::avatars, 0, i));
-            avatars.back().set_bg_priority(0);
-        }
         for(int index = 0; index < meter_sections; ++index)
         {
             bar.push_back(make_sprite(bn::sprite_items::meter, 1));
@@ -321,7 +476,7 @@ public:
         }
     }
 
-    void show_lobby(const Profile& profile)
+    void show_lobby(const Career& career, int focus = 0)
     {
         clear_panel();
         line.close();
@@ -331,14 +486,27 @@ public:
         background.reset();
         background = bn::regular_bg_items::lobby.create_bg(8, 48);
         background->set_priority(3);
-        hide_sprites();
+        release_match_sprites();
         hud.clear();
         footer.clear();
-        const Rival& rival = rivals[profile.rival_index()];
-        label(hud, 52, 104, bn::format<16>("{}", profile.rating), mint_text, Align::LEFT);
-        label(hud, 116, 104, "VS", muted_text);
-        label(hud, 134, 104, rival.name);
-        label(hud, 193, 104, bn::format<24>("{} W / {} L", profile.wins, profile.losses), muted_text);
+        const Profile& profile = career.profile;
+        const Rival& rival = rivals[career.rival_index()];
+        label(hud, 52, 99, bn::format<16>("{}", profile.rating), mint_text, Align::LEFT);
+        label(hud, 105, 99, "VS", muted_text);
+        label(hud, 130, 99, rival.short_name);
+        label(hud, 193, 99, bn::format<24>("{} W / {} L", profile.wins, profile.losses), muted_text);
+        title_options(focus);
+    }
+
+    void title_options(int focus)
+    {
+        menu_text.clear();
+        menu_option(64, 118, "RIVALS", focus == 0);
+        menu_option(176, 118, "RECORD", focus == 1);
+        menu_option(64, 137, "GEAR", focus == 2);
+        menu_option(176, 137, "LINK CABLE", focus == 3);
+        label(menu_text, 64, 151, "START  QUICK MATCH", muted_text);
+        label(menu_text, 176, 151, "SELECT  CONTROLS", muted_text);
     }
 
     void show_menu()
@@ -351,15 +519,283 @@ public:
         background.reset();
         background = bn::regular_bg_items::menu.create_bg(8, 48);
         background->set_priority(3);
-        hide_sprites();
+        release_match_sprites();
         hud.clear();
         footer.clear();
+    }
+
+    void show_roster(const Career& career, int index)
+    {
+        open_panel();
+        const Rival& rival = rivals[index];
+        bool unlocked = index <= career.rival_index();
+        label(panel_text, 120, 34, "RIVALS", gold_text);
+        label(panel_text, 203, 34, bn::format<16>("< {} / {} >", index + 1, rival_count), muted_text, Align::RIGHT);
+        portrait = index == boss_rival ? make_sprite(bn::sprite_items::finn_portrait, 0) :
+                   make_sprite(bn::sprite_items::rival_portraits, 0, index);
+        portrait->set_bg_priority(0);
+        position(*portrait, 64, 80);
+        portrait->set_visible(true);
+
+        label(panel_text, 104, 51, rival.name, gold_text, Align::LEFT);
+        label(panel_text, 104, 63, bn::format<24>("{}  /  ELO {}", rival.rank, rival.rating), mint_text, Align::LEFT);
+        bool defeated = career.owns(index);
+        label(panel_text, 104, 78, defeated ? "REWARDS EARNED" : "FIRST WIN REWARDS", muted_text, Align::LEFT);
+        label(panel_text, 104, 88, cues[index + 1].name, ivory_text, Align::LEFT);
+        label(panel_text, 104, 98, accessories[index], ivory_text, Align::LEFT);
+        if(defeated)
+        {
+            int wins = career.wins_by_rival[index];
+            label(panel_text, 104, 111, wins >= 10 ? bn::string<24>("MASTERED") :
+                  bn::format<24>("{} WINS", wins), mint_text, Align::LEFT);
+        }
+        else if(! unlocked)
+        {
+            label(panel_text, 104, 111, bn::format<24>("BEAT {} FIRST", rivals[index - 1].short_name),
+                  muted_text, Align::LEFT);
+        }
+        if(unlocked)
+        {
+            menu_option(46, 130, "PLAY", true, Align::LEFT);
+        }
+        else
+        {
+            label(menu_text, 36, 130, "LOCKED", muted_text, Align::LEFT);
+        }
+        label(menu_text, 203, 130, "B TITLE", muted_text, Align::RIGHT);
+    }
+
+    void show_record(const Career& career, RecordPage page, int offset)
+    {
+        open_panel();
+        label(panel_text, 120, 34, "RECORD", gold_text);
+        menu_option(61, 49, "RATING", page == RecordPage::rating);
+        menu_option(120, 49, "MATCHES", page == RecordPage::history);
+        menu_option(179, 49, "BADGES", page == RecordPage::badges);
+        if(page == RecordPage::history)
+        {
+            label(panel_text, 37, 63, "RIVAL", muted_text, Align::LEFT);
+            label(panel_text, 114, 63, "RESULT", muted_text);
+            label(panel_text, 157, 63, "ELO", muted_text, Align::RIGHT);
+            label(panel_text, 203, 63, "CHANGE", muted_text, Align::RIGHT);
+            if(! career.count)
+            {
+                label(panel_text, 120, 88, "NO MATCHES YET", muted_text);
+            }
+            for(int row = 0; row < matches_per_page && offset + row < career.count; ++row)
+            {
+                const CareerMatch& match = career.recent(offset + row);
+                int y = 75 + row * 9;
+                label(panel_text, 37, y, rivals[match.rival].short_name, ivory_text, Align::LEFT);
+                label(panel_text, 114, y, match.won ? "WIN" : "LOSS", match.won ? mint_text : muted_text);
+                label(panel_text, 157, y, bn::format<8>("{}", match.rating), ivory_text, Align::RIGHT);
+                rating_change(191, 203, y, match.change);
+            }
+            if(career.count > matches_per_page)
+            {
+                label(menu_text, 120, 130, bn::format<24>("PAGE {} / {}", offset / matches_per_page + 1,
+                      (career.count + matches_per_page - 1) / matches_per_page), muted_text);
+            }
+        }
+        else if(page == RecordPage::rating)
+        {
+            label(panel_text, 120, 62, bn::format<32>("ELO {}   BEST {}", career.profile.rating,
+                  career.profile.best), mint_text);
+            show_rating_chart(career);
+            label(menu_text, 120, 130, bn::format<20>("{} PLOTTED", career.count), muted_text);
+        }
+        else
+        {
+            show_badges(career);
+        }
+        label(menu_text, 36, 130, "L / R TABS", mint_text, Align::LEFT);
+        label(menu_text, 203, 130, "B TITLE", muted_text, Align::RIGHT);
+    }
+
+    void show_loadout(const Career& career, int focus)
+    {
+        open_panel();
+        label(panel_text, 120, 34, "YOUR GEAR", gold_text);
+        constexpr int portrait_y = 82;
+        for(int x : { 70, 170 })
+        {
+            loadout_frames.push_back(make_sprite(bn::sprite_items::gear_frame, 2));
+            bn::sprite_ptr& frame = loadout_frames.back();
+            frame.set_bg_priority(0);
+            position(frame, x, portrait_y);
+            frame.set_visible(true);
+        }
+
+        show_gear_icon(career.equipped, false, true, 70, portrait_y, true);
+
+        int outfit = career.outfit;
+        panel_detail = make_sprite(bn::sprite_items::wardrobe_portraits, 0,
+                                   outfit ? outfit - 1 : accessory_count);
+        position(*panel_detail, 170, portrait_y);
+        panel_detail->set_bg_priority(0);
+        panel_detail->set_visible(true);
+        gear_options(focus);
+    }
+
+    void gear_options(int focus)
+    {
+        menu_text.clear();
+        menu_option(70, 130, "CUES", focus == 0);
+        menu_option(170, 130, "WARDROBE", focus == 1);
+    }
+
+    void show_collection(const Career& career, int item, bool clothing, bool details)
+    {
+        open_panel();
+        bool owned = clothing ? career.owns_accessory(item) : career.owns_cue(item);
+        bool equipped = clothing ? career.outfit == item + 1 : career.equipped == item;
+        label(panel_text, 120, 34, clothing ? "WARDROBE" : "CUES", gold_text);
+        label(panel_text, 203, 34, bn::format<16>("< {} / {} >", item + 1,
+              clothing ? accessory_count : cue_count), muted_text, Align::RIGHT);
+        panel_detail = make_sprite(bn::sprite_items::gear_frame, 2);
+        position(*panel_detail, 64, 80);
+        panel_detail->set_bg_priority(0);
+        panel_detail->set_visible(true);
+        show_gear_icon(item, clothing, owned, 64, 80, true);
+
+        label(panel_text, 104, 52, clothing ? accessories[item] : cues[item].name, gold_text, Align::LEFT);
+        label(panel_text, 104, 64, equipped ? "EQUIPPED" : owned ? "OWNED" : "LOCKED",
+              equipped ? mint_text : muted_text, Align::LEFT);
+        if(clothing)
+        {
+            constexpr const char* descriptions[] = {
+                "BRASS-TRIMMED VEST", "FROSTED SATIN BOW", "IVORY-TIPPED EARS", "PLUM CAP WITH INK PIN",
+                "STEEL BLUE DORSAL FIN", "SMOKED LENSES", "CLOTH TEAM BAND", "BRUSHED GOLD BRIM"
+            };
+            label(panel_text, 104, 82, descriptions[item], ivory_text, Align::LEFT);
+        }
+        else if(details)
+        {
+            const CueSpec& cue = cues[item];
+            label(panel_text, 104, 76, cue.power, mint_text, Align::LEFT);
+            label(panel_text, 104, 87, cue.tip, ivory_text, Align::LEFT);
+            if(cue.ability == CueAbility::tailspin || cue.ability == CueAbility::surge)
+            {
+                label(panel_text, 104, 98, bn::format<24>("+{}%  {}", cue.ability == CueAbility::tailspin ?
+                      tailspin_bonus : surge_bonus, cue.ability == CueAbility::tailspin ? "SPIN" : "SHOT SPEED"),
+                      ivory_text, Align::LEFT);
+            }
+            else
+            {
+                label(panel_text, 104, 98, cue.detail, ivory_text, Align::LEFT);
+            }
+            if(item && owned)
+            {
+                label(panel_text, 104, 110, "L + R  AFTER THE BREAK", muted_text, Align::LEFT);
+            }
+        }
+        else
+        {
+            show_cue_stats(cues[item]);
+            if(item && owned)
+            {
+                label(panel_text, 104, 110, cues[item].power, muted_text, Align::LEFT);
+            }
+        }
+
+        if(! owned)
+        {
+            if(clothing && item >= rival_count)
+            {
+                label(panel_text, 104, 107, item == chalk_headband ? "WIN A RIVAL MATCH" : "BEAT FINN",
+                      muted_text, Align::LEFT);
+            }
+            else
+            {
+                label(panel_text, 104, 107, bn::format<28>("BEAT {} TO UNLOCK",
+                      rivals[clothing ? item : item - 1].short_name), muted_text, Align::LEFT);
+            }
+        }
+
+        if(owned && (clothing || ! equipped))
+        {
+            menu_option(46, 130, equipped ? "REMOVE" : "EQUIP", true, Align::LEFT);
+        }
+        if(! clothing && item)
+        {
+            label(menu_text, 120, 130, details ? "SEL STATS" : "SEL ABILITY", mint_text);
+        }
+        label(menu_text, 203, 130, "B GEAR", muted_text, Align::RIGHT);
+    }
+
+    void show_badges(const Career& career)
+    {
+        int mastered = 0;
+        for(uint8_t wins : career.wins_by_rival)
+        {
+            mastered += wins >= 10;
+        }
+        const char* labels[] = { "FIRST SIGNATURE CUE", "THREE WIN STREAK", "DEFEAT FINN",
+                                 "ALL SIGNATURE CUES", "MASTER A RIVAL", "FIVE-SHOT CHALLENGE" };
+        bool earned[] = { bool(career.defeated), career.best_streak >= 3, career.owns(boss_rival),
+                          career.defeated == (1 << rival_count) - 1, mastered > 0, career.challenges > 0 };
+        for(int index = 0; index < 6; ++index)
+        {
+            int y = 63 + index * 8;
+            label(panel_text, 38, y, labels[index], ivory_text, Align::LEFT);
+            label(panel_text, 200, y, earned[index] ? "EARNED" : "LOCKED", earned[index] ? gold_text : muted_text,
+                  Align::RIGHT);
+        }
+        label(panel_text, 120, 116, bn::format<32>("BEST STREAK {}  /  {} MASTERED", career.best_streak, mastered),
+              mint_text);
+    }
+
+    void set_equipment(int style, int outfit)
+    {
+        active_outfit = outfit;
+        if(style == cue_style)
+        {
+            return;
+        }
+        cue_style = style;
+        stick.set_tiles(bn::sprite_items::cue.tiles_item(), style);
+        close_stick_length = 0;
+        auto colors = cue_colors(style);
+        bn::sprite_palette_item recolored(colors, bn::bpp_mode::BPP_4);
+        bn::sprite_palette_ptr palette = stick.palette();
+        palette.set_colors(recolored);
+        bn::sprite_palette_ptr close_palette = close_stick.palette();
+        if(close_palette != palette)
+        {
+            close_palette.set_colors(recolored);
+        }
+    }
+
+    void show_taunt(int rival, Banter event)
+    {
+        taunt_text.clear();
+        taunt_chips.clear();
+        if(rival < 0)
+        {
+            return;
+        }
+        bn::string_view quote = banter_line(rival, event);
+        int width = std::clamp((text.width(quote) + 11) & ~3, 52, 120);
+        int left = std::min(144, 234 - width);
+        int first_tile = (width - 52) / 4 * 2;
+        // Solo rivals occupy the right-hand card in either HUD layout.
+        int top = full_hud ? 34 : 17;
+        for(int side = 0; side < 2; ++side)
+        {
+            taunt_chips.push_back(make_sprite(bn::sprite_items::taunt_chip, 1, first_tile + side));
+            bn::sprite_ptr& chip = taunt_chips.back();
+            position(chip, left + 32 + side * 64, top + 16);
+            chip.set_bg_priority(0);
+            chip.set_visible(true);
+        }
+        label(taunt_text, left + width / 2, top + 11, quote);
     }
 
     void show_room(bool start_close)
     {
         clear_panel();
         hide_match_hud();
+        create_match_sprites();
         line.close();
         aim_table.close();
         aim_backdrop.reset();
@@ -395,33 +831,33 @@ public:
         open_panel();
         label(panel_text, 120, 34, "HOW TO PLAY", gold_text);
         constexpr const char* buttons[] = {
-            "L / R", "D-PAD", "PAUSE / UP", "PAUSE / L / R", "SELECT", "HOLD A", "B", "D-PAD / A"
+            "L / R", "L + R", "D-PAD", "PAUSE / D-PAD", "PAUSE / L / R", "SELECT", "HOLD A", "B", "D-PAD / A"
         };
         constexpr const char* actions[] = {
-            "AIM", "SET SPIN", "CHANGE HUD SIZE", "CYCLE POCKET LINES", "SWITCH CAMERAS",
+            "AIM", "ACTIVATE EQUIPPED CUE", "SET SPIN", "CHOOSE AN OPTION", "CYCLE POCKET LINES", "SWITCH CAMERAS",
             "RELEASE TO SHOOT", "CANCEL / RECALL 8", "MOVE / PLACE CUE"
         };
-        for(int row = 0; row < 8; ++row)
+        for(int row = 0; row < 9; ++row)
         {
-            label(panel_text, 39, 51 + row * 9, buttons[row], mint_text, Align::LEFT);
-            label(panel_text, 112, 51 + row * 9, actions[row], ivory_text, Align::LEFT);
+            label(panel_text, 39, 49 + row * 8, buttons[row], mint_text, Align::LEFT);
+            label(panel_text, 112, 49 + row * 8, actions[row], ivory_text, Align::LEFT);
         }
-        label(panel_text, 120, 130, "A / B  BACK", gold_text);
+        menu_option(120, 130, paused ? "RETURN TO PAUSE" : "RETURN TO TITLE", true);
     }
 
-    void pause(bool linked, bool full_hud_enabled, int lines, int selected)
+    void pause(bool linked, bool full_hud_enabled, int lines, int selected, int focus)
     {
         open_panel(true);
         label(panel_text, 120, 47, "MATCH PAUSED", gold_text);
-        label(panel_text, 120, 68, "A  RESUME", ivory_text);
-        label(panel_text, 120, 92, linked ? "B  LEAVE MATCH" : "B  CONCEDE", ivory_text);
-        label(panel_text, 120, 110, full_hud_enabled ? "UP / DOWN  FULL HUD" : "UP / DOWN  COMPACT HUD", mint_text);
+        menu_option(120, 65, "RESUME", focus == 0);
+        menu_option(120, 82, full_hud_enabled ? "HUD: FULL" : "HUD: COMPACT", focus == 1);
         if(lines)
         {
-            label(panel_text, 120, 120, selected >= 0 ? bn::format<24>("L / R  LINE {} / {}", selected + 1, lines) :
-                  bn::string<24>("L / R  POCKET LINES"), mint_text);
+            menu_option(120, 98, selected >= 0 ? bn::format<24>("POCKET LINE {} / {}", selected + 1, lines) :
+                        bn::string<24>("POCKET LINES"), focus == 2);
         }
-        label(panel_text, 120, 131, "SELECT  CONTROLS", muted_text);
+        menu_option(120, 114, "CONTROLS", focus == 3);
+        menu_option(120, 130, linked ? "LEAVE MATCH" : "CONCEDE", focus == 4);
     }
 
     void concession(bool linked)
@@ -429,7 +865,7 @@ public:
         open_panel();
         label(panel_text, 120, 34, linked ? "LEAVE LINK MATCH" : "CONCEDE MATCH", gold_text);
         label(panel_text, 120, 80, linked ? "THIS ENDS THE MATCH FOR BOTH PLAYERS" : "THIS COUNTS AS A RANKED LOSS");
-        panel_actions(linked ? "A  LEAVE" : "A  CONCEDE", "B  BACK");
+        confirm_options(linked, 0);
     }
 
     void link_status(const char* heading, const char* first, const char* second, const char* action)
@@ -444,7 +880,7 @@ public:
         }
         if(action[0] != '\0')
         {
-            label(panel_text, 120, 130, action, mint_text);
+            menu_option(120, 130, action, true);
         }
     }
 
@@ -453,34 +889,77 @@ public:
         link_status(won ? "YOU WIN" : "YOU LOSE", reason, "LINK CABLE MATCH", "A / B  LOBBY");
     }
 
-    void result(bool won, const char* reason, const Profile& profile, int change, int new_rival)
+    void result(bool won, const char* reason, const Career& career, MatchReward reward, int new_rival, int rival)
     {
         open_panel();
         label(panel_text, 120, 34, won ? "YOU WIN" : "YOU LOSE", gold_text);
-        label(panel_text, 120, 66, reason, muted_text);
-        label(panel_text, 120, 81,
-              bn::format<48>("RATING {}  {}{}", profile.rating, change >= 0 ? "+" : "-", change >= 0 ? change : -change),
-              mint_text);
+        label(panel_text, 120, 55, reason, muted_text);
+        label(panel_text, 119, 68, bn::format<16>("ELO {}", career.profile.rating), mint_text, Align::RIGHT);
+        rating_change(140, 152, 68, reward.rating);
+        if(reward.cue)
+        {
+            show_gear_icon(reward.cue, false, true, 64, 82);
+            label(panel_text, 103, 81, bn::format<32>("EARNED  {}", cues[reward.cue].name), gold_text, Align::LEFT);
+        }
+        if(reward.accessory)
+        {
+            panel_detail = make_sprite(bn::sprite_items::cosmetic_avatars, 0, reward.accessory - 1);
+            position(*panel_detail, 64, 99);
+            panel_detail->set_bg_priority(0);
+            panel_detail->set_visible(true);
+            label(panel_text, 103, 94, bn::format<32>("UNLOCKED  {}", accessories[reward.accessory - 1]), gold_text,
+                  Align::LEFT);
+        }
+        else if(reward.milestone)
+        {
+            label(panel_text, 120, 94, "RIVAL MASTERED", gold_text);
+        }
+        else if(reward.challenge)
+        {
+            label(panel_text, 120, 94, "FIVE-SHOT CHALLENGE CLEARED", gold_text);
+        }
         if(new_rival >= 0)
         {
-            label(panel_text, 120, 97,
-                  bn::format<48>("UNLOCKED  {} / {}", rivals[new_rival].name, rivals[new_rival].rank));
+            label(panel_text, 132, 106, bn::format<40>("NEXT  {}", rivals[new_rival].name), mint_text);
         }
-        else
-        {
-            label(panel_text, 120, 97, bn::format<48>("{} W / {} L   BEST {}", profile.wins, profile.losses, profile.best));
-        }
-        panel_actions("A  NEXT MATCH", "B  LOBBY");
+        label(panel_text, 120, 115, banter_line(rival, won ? Banter::player_win : Banter::rival_win), muted_text);
+        result_options(0, new_rival >= 0);
+    }
+
+    void confirm_options(bool linked, int focus)
+    {
+        menu_text.clear();
+        menu_option(75, 130, linked ? "LEAVE" : "CONCEDE", focus == 0);
+        menu_option(165, 130, "CANCEL", focus == 1);
+    }
+
+    void result_options(int focus, bool next_match)
+    {
+        menu_text.clear();
+        menu_option(75, 130, next_match ? "NEXT MATCH" : "REMATCH", focus == 0);
+        menu_option(165, 130, "PICK RIVAL", focus == 1);
     }
 
     void clear_panel()
     {
-        panel_text.clear();
+        clear_panel_contents();
         panel.reset();
     }
 
-    void scoreboard(const EightBall& game, const Profile& profile, const Rival& rival, Phase phase,
-                    int choices, int selected, int link_player, int call, int cursor_pocket, bool full, CueSpin spin)
+    void release_match_sprites()
+    {
+        hide_playfield();
+        hide_match_hud();
+        // Hidden sprites still hold their palettes until the handles are released.
+        balls.clear();
+        shadows.clear();
+        group_balls.clear();
+        avatars.clear();
+        cue_tint = CueBallTint::ivory;
+    }
+
+    void scoreboard(const EightBall& game, const Profile& profile, int rival_index, Phase phase,
+                    int choices, int selected, int link_player, int call, int cursor_pocket, bool full, CueSpin spin, bool relocating, const char* ability_hint)
     {
         if(! match_hud || full != full_hud)
         {
@@ -490,11 +969,12 @@ public:
             match_hud->set_priority(0);
             full_hud = full;
         }
+        const Rival& rival = rivals[rival_index];
         hud.clear();
         footer.clear();
         bool linked = link_player >= 0;
         int local = linked ? link_player : 0;
-        int ball_y = full ? 20 : 9;
+        int ball_y = full ? 27 : 9;
         int card_left = game.player ? 148 : 3;
         for(int side = 0; side < 2; ++side)
         {
@@ -510,24 +990,37 @@ public:
             if(full)
             {
                 int left = center - 44;
-                avatars[player].set_tiles(bn::sprite_items::avatars.tiles_item(), linked ? player : player ? 2 : 0);
-                position(avatars[player], left + 8, 8);
+                if(! linked && player == local && active_outfit)
+                {
+                    avatars[player].set_item(bn::sprite_items::cosmetic_avatars, active_outfit - 1);
+                }
+                else if(! linked && player != local)
+                {
+                    if(rival_index == boss_rival)
+                    {
+                        avatars[player].set_item(bn::sprite_items::finn_icon);
+                    }
+                    else
+                    {
+                        avatars[player].set_item(bn::sprite_items::rival_icons, rival_index);
+                    }
+                }
+                else
+                {
+                    avatars[player].set_item(bn::sprite_items::avatars, linked ? player : 0);
+                }
+                position(avatars[player], left + 12, 12);
                 const auto& name_color = player == game.player ? gold_text : ivory_text;
-                const char* name = player == local ? "YOU" : linked ? "FRIEND" : rival.name;
-                label(hud, left + 15, 8, name, name_color, Align::LEFT);
-                label(hud, center + 39, 8, linked ? bn::format<12>("GBA {}", player + 1) :
-                      bn::format<12>("{}", player ? rival.rating : profile.rating), mint_text, Align::RIGHT);
+                const char* name = player == local ? "YOU" : linked ? "FRIEND" : rival.short_name;
+                label(hud, left + 26, 9, name, name_color, Align::LEFT);
+                label(hud, left + 26, 16, linked ? bn::format<12>("GBA {}", player + 1) :
+                      bn::format<12>("ELO {}", player ? rival.rating : profile.rating), mint_text, Align::LEFT);
             }
             avatars[player].set_visible(full);
 
-            // Before assignment the two rows show the two groups still on the table.
             Group group = game.groups[player];
             bool assigned = group != Group::open;
-            if(! assigned)
-            {
-                group = player ? Group::stripes : Group::solids;
-            }
-            int count = game.remaining(group);
+            int count = assigned ? game.remaining(group) : 0;
             bool on_eight = assigned && count == 0;
             int first = group == Group::stripes ? 9 : 1;
             int visible = 0;
@@ -535,7 +1028,7 @@ public:
             {
                 bn::sprite_ptr& icon = group_balls[player * 7 + index];
                 int id = first + index;
-                bool show = on_eight ? index == 0 : game.table.balls[id].live;
+                bool show = assigned && (on_eight ? index == 0 : game.table.balls[id].live);
                 if(show)
                 {
                     icon.set_item(*ball_items[on_eight ? 8 : id]);
@@ -549,7 +1042,7 @@ public:
 
         for(int i = 0; i < meter_sections; ++i)
         {
-            position(bar[i], 104 + i * 8, ball_y);
+            position(bar[i], 104 + i * 8, full ? 21 : ball_y);
         }
         show_power(true);
         bool show_spin = phase == Phase::aim || phase == Phase::charge;
@@ -561,16 +1054,21 @@ public:
         spin_dot.set_visible(show_spin);
         if(full)
         {
-            label(hud, 120, 8, "POWER", muted_text);
+            label(hud, 120, 10, "POWER", muted_text);
         }
 
         if(phase == Phase::call)
         {
-            status(bn::format<32>("CALL: {}", pocket_names[cursor_pocket]), "D-PAD CYCLE / A CALL");
+            status(bn::format<32>("CALL: {}", pocket_names[cursor_pocket]));
         }
         else if(phase == Phase::place)
         {
-            status(foul_label(game.notice), "D-PAD MOVE / A PLACE");
+            status(relocating ? "LONG REACH" : foul_label(game.notice),
+                   relocating ? "A PLACE / B CANCEL" : "D-PAD MOVE / A PLACE");
+        }
+        else if(ability_hint)
+        {
+            status(ability_hint, call >= 0 ? "B CHANGE POCKET" : "");
         }
         else if(full)
         {
@@ -581,13 +1079,13 @@ public:
             }
             else if(phase == Phase::cpu_wait || phase == Phase::cpu_aim)
             {
-                status(bn::format<32>("{} {}", rival.name, game.breaking ? "BREAKS" : "IS AIMING"),
+                status(bn::format<32>("{} {}", rival.short_name, game.breaking ? "BREAKS" : "IS AIMING"),
                        game.ball_in_hand ? "BALL IN HAND" : "");
             }
             else if(phase == Phase::rolling)
             {
                 status(game.player == local ? bn::string<32>("YOUR SHOT") :
-                       bn::format<32>("{} SHOT", linked ? "FRIEND" : rival.name));
+                       bn::format<32>("{} SHOT", linked ? "FRIEND" : rival.short_name));
             }
             else if(call >= 0)
             {
@@ -644,9 +1142,9 @@ public:
             return true;
         }
 
-        if(hold_camera && camera_angle >= 0)
+        if(hold_camera && camera_angle >= 0 && pocket == camera_pocket)
         {
-            // Keep the last displayed pose throughout the shot and opponent's turn.
+            // Hold the view while the balls roll.
             staged_angle = -1;
             staged_settle = false;
             settle_steps = 0;
@@ -671,6 +1169,7 @@ public:
             camera = staged_camera;
             camera_anchor = staged_anchor;
             camera_angle = staged_angle;
+            camera_pocket = staged_pocket;
             ++camera_revision;
             staged_angle = -1;
             staged_settle = false;
@@ -680,7 +1179,8 @@ public:
             return true;
         }
 
-        if(angle == camera_angle && cue.x == camera_anchor.x && cue.y == camera_anchor.y)
+        if(angle == camera_angle && cue.x == camera_anchor.x && cue.y == camera_anchor.y &&
+           pocket == camera_pocket)
         {
             settle_steps = 0;
             return true;
@@ -698,7 +1198,8 @@ public:
         staged_camera = AimCamera(cue, angle);
         staged_angle = angle;
         staged_anchor = cue;
-        aim_table.draw(staged_camera);
+        staged_pocket = pocket;
+        aim_table.draw(staged_camera, pocket);
         return false;
     }
 
@@ -712,7 +1213,7 @@ public:
             return target;
         }
         // Keep at most one small turn queued ahead of the pose currently being rendered.
-        constexpr int max_pose_turn = 7;
+        constexpr int max_pose_turn = 11;
         int base = staged_angle >= 0 ? staged_angle : camera_angle;
         return (base + std::clamp(angle_delta(target, base), -max_pose_turn, max_pose_turn)) & (angle_count - 1);
     }
@@ -877,10 +1378,10 @@ public:
             if(length != close_stick_length)
             {
                 close_stick_length = length;
-                close_stick.set_tiles(bn::sprite_items::close_cue.tiles_item(), std::min(length, 32) - 1);
+                close_stick.set_tiles(bn::sprite_items::close_cue.tiles_item(), cue_style * 64 + std::min(length, 32) - 1);
                 if(length > 32)
                 {
-                    close_tail.set_tiles(bn::sprite_items::close_cue.tiles_item(), length - 1);
+                    close_tail.set_tiles(bn::sprite_items::close_cue.tiles_item(), cue_style * 64 + length - 1);
                 }
             }
             position(close_stick, 120, tip_row + 16);
@@ -905,12 +1406,21 @@ public:
         }
     }
 
-    void trajectory(const EightBall& game, int angle)
+    void trajectory(const EightBall& game, int angle, bool bank_aid)
     {
         const Table& table = game.table;
         Vec cue = table.balls[0].pos;
         Vec heading = direction(angle);
-        Ray first = table.trace(cue, heading, 0);
+        Preview preview;
+        if(bank_aid)
+        {
+            preview = trace_aim(table, heading);
+        }
+        else
+        {
+            preview.first = table.trace(cue, heading, 0);
+        }
+        const Ray& first = preview.first;
         SphereProjection cue_ball = project_sphere(cue);
         Vec ghost_center = project_sphere(first.end).center;
         ghost_center = { (ghost_center.x & -unit) + unit / 2, (ghost_center.y & -unit) + unit / 2 };
@@ -958,18 +1468,46 @@ public:
         {
             line.draw(cue_ball.center, project(end, ball_height), ink);
         }
+        if(bank_aid && first.rail)
+        {
+            Vec travel_path = preview.bank.end - first.end;
+            int distance = length(travel_path);
+            if(distance > 6 * unit)
+            {
+                Vec rebound = normalized(travel_path);
+                LineInk bank_ink = preview.bank.ball >= 0 && ! game.legal_target(preview.bank.ball) ?
+                                   LineInk::warning : LineInk::bank;
+                line.draw(project(first.end + travel(rebound, show_ghost ? ghost_ball_radius : 0), ball_height),
+                          project(preview.bank.end, ball_height), bank_ink);
+            }
+        }
+        else if(bank_aid && preview.object_moves && game.legal_target(first.ball))
+        {
+            line.draw(project(table.balls[first.ball].pos, ball_height),
+                      project(preview.object.end, ball_height), LineInk::bank);
+        }
         line.commit();
     }
 
 private:
     bn::optional<bn::regular_bg_ptr> background;
     bn::optional<bn::regular_bg_ptr> panel;
+    bn::optional<bn::sprite_ptr> portrait;
+    bn::optional<bn::sprite_ptr> panel_detail;
+    bn::vector<bn::sprite_ptr, rating_plot_slices> chart;
+    bn::vector<bn::sprite_ptr, 2> loadout_frames;
+    bn::optional<bn::sprite_ptr> cue_stats;
+    int cue_style = 0;
+    int active_outfit = 0;
     bool pause_panel_open = false;
     bn::optional<bn::regular_bg_ptr> match_hud;
     bn::optional<bn::regular_bg_ptr> aim_backdrop;
     bn::sprite_text_generator text{ hud_font };
     bn::vector<bn::sprite_ptr, 16> hud;
     bn::vector<bn::sprite_ptr, 16> footer;
+    bn::vector<bn::sprite_ptr, 20> menu_text;
+    bn::vector<bn::sprite_ptr, 8> taunt_text;
+    bn::vector<bn::sprite_ptr, 2> taunt_chips;
     bn::vector<bn::sprite_ptr, 48> panel_text;
     bn::vector<bn::sprite_ptr, 16> balls;
     bn::vector<bn::sprite_ptr, 16> shadows;
@@ -985,6 +1523,8 @@ private:
     Vec staged_anchor;
     int camera_angle = -1;
     int staged_angle = -1;
+    int camera_pocket = -1;
+    int staged_pocket = -1;
     int settle_steps = 0;
     bool camera_held = false;
     bool staged_settle = false;
@@ -1024,15 +1564,158 @@ private:
     {
         text.set_palette_item(palette);
         text.set_alignment(align);
-        bool on_panel = &target == &panel_text || bool(match_hud);
+        bool on_panel = &target == &panel_text || &target == &taunt_text ||
+                        (&target == &menu_text && bool(panel)) || bool(match_hud);
         text.set_bg_priority(on_panel ? 0 : 2);
         text.generate(x - 120, y - 80, value, target);
     }
 
-    void panel_actions(const char* primary, const char* secondary)
+    void show_gear_icon(int item, bool clothing, bool owned, int x, int y, bool large = false)
     {
-        label(panel_text, 75, 130, primary, gold_text);
-        label(panel_text, 165, 130, secondary, mint_text);
+        const auto& artwork = clothing ? bn::sprite_items::wardrobe_portraits :
+                              (large ? bn::sprite_items::cue_previews : bn::sprite_items::cue);
+        auto palette = artwork.palette_item();
+        bn::array<bn::color, 16> colors{};
+        if(! owned)
+        {
+            std::fill_n(colors.data() + 1, 15, bn::color(8, 13, 16));
+            palette = bn::sprite_palette_item(colors, bn::bpp_mode::BPP_4);
+        }
+        else if(! clothing)
+        {
+            colors = cue_colors(item);
+            palette = bn::sprite_palette_item(colors, bn::bpp_mode::BPP_4);
+        }
+        bn::sprite_item preview(artwork.shape_size(), artwork.tiles_item(), palette);
+        portrait = make_sprite(preview, 0, item);
+        position(*portrait, x, y);
+        portrait->set_bg_priority(0);
+        portrait->set_visible(true);
+    }
+
+    void show_cue_stats(const CueSpec& cue)
+    {
+        constexpr int bar_width = 52;
+        constexpr int bar_start = 2;
+        constexpr int first_row_y = 76;
+        constexpr int row_spacing = 11;
+        static constexpr bn::array<bn::color, 16> colors = {
+            bn::color(), { 10, 17, 20 }, { 11, 20, 23 }, { 13, 24, 26 }, { 17, 28, 28 },
+            { 10, 13, 16 }, { 6, 9, 11 }
+        };
+        constexpr const char* names[] = { "POWER", "SPIN", "CONTROL" };
+        const int values[] = { cue.speed, cue.spin, cue.control };
+        std::memset(cue_stat_tiles, 0, sizeof(cue_stat_tiles));
+        for(int stat = 0; stat < 3; ++stat)
+        {
+            int y = first_row_y + stat * row_spacing;
+            int value = values[stat];
+            label(panel_text, 104, y, names[stat], muted_text, Align::LEFT);
+            label(panel_text, 212, y, bn::format<8>("{}", value), ivory_text, Align::RIGHT);
+            int filled = (value * bar_width + 50) / 100;
+            unsigned fill_ink = value >= 90 ? 4 : value >= 80 ? 3 : value >= 70 ? 2 : 1;
+            for(int row = 0; row < 4; ++row)
+            {
+                int py = stat * row_spacing + row + 2;
+                for(int x = 0; x < bar_width; ++x)
+                {
+                    int px = bar_start + x;
+                    unsigned color = x < filled ? fill_ink : unsigned(row == 0 ? 5 : 6);
+                    cue_stat_tiles[(py >> 3) * 8 + (px >> 3)].data[py & 7] |= color << ((px & 7) * 4);
+                }
+            }
+        }
+        bn::sprite_tiles_item tiles(cue_stat_tiles, bn::bpp_mode::BPP_4);
+        bn::sprite_palette_item palette(colors, bn::bpp_mode::BPP_4);
+        bn::sprite_item item(bn::sprite_shape_size(64, 32), tiles, palette);
+        cue_stats = make_sprite(item, 1);
+        bn::sprite_tiles_ptr tiles_ptr = cue_stats->tiles();
+        tiles_ptr.reload_tiles_ref();
+        cue_stats->set_bg_priority(0);
+        position(*cue_stats, 175, first_row_y + 12);
+        cue_stats->set_visible(true);
+    }
+
+    void rating_change(int sign_x, int value_x, int y, int change)
+    {
+        const auto& ink = change < 0 ? muted_text : gold_text;
+        label(panel_text, sign_x, y, change < 0 ? "-" : "+", ink);
+        label(panel_text, value_x, y, bn::format<8>("{}", std::abs(change)), ink, Align::RIGHT);
+    }
+
+    void show_rating_chart(const Career& career)
+    {
+        int initial_rating = career.profile.rating;
+        if(career.count)
+        {
+            const CareerMatch& first = career.recent(career.count - 1);
+            initial_rating = first.rating - first.change;
+        }
+        int low = std::min(initial_rating, career.profile.rating);
+        int high = std::max(initial_rating, career.profile.rating);
+        for(int age = 0; age < career.count; ++age)
+        {
+            int rating = career.recent(age).rating;
+            low = std::min(low, rating);
+            high = std::max(high, rating);
+        }
+        if(high <= 1200)
+        {
+            low = std::min(low, 800);
+            high = 1200;
+        }
+        else
+        {
+            low = std::max(100, low - 28);
+            high = std::max(high + 24, low + 320);
+        }
+        constexpr int origin_y = 71;
+        auto row = [&](int rating) { return 35 - (rating - low) * 33 / (high - low); };
+        std::memset(rating_tiles, 0, sizeof(rating_tiles));
+        for(int rating : { high, (low + high) / 2, low })
+        {
+            int y = row(rating);
+            for(int x = 0; x < rating_plot_width; x += 2)
+            {
+                rating_pixel(x, y, 3);
+            }
+        }
+        Vec last{ 2, row(initial_rating) };
+        rating_pixel(last.x, last.y, 8);
+        for(int index = 0; index < career.count; ++index)
+        {
+            const CareerMatch& match = career.recent(career.count - 1 - index);
+            Vec point{ 2 + (index + 1) * (rating_plot_width - 4) / career.count, row(match.rating) };
+            rating_segment(last, point);
+            last = point;
+        }
+        if(! career.count)
+        {
+            label(panel_text, 120, 93, "NO MATCHES YET", muted_text);
+        }
+        label(panel_text, 120, 115, "ELO RANGE", muted_text);
+        label(panel_text, rating_plot_left, 115, bn::format<8>("{}", low), muted_text, Align::LEFT);
+        label(panel_text, rating_plot_left + rating_plot_width - 1, 115, bn::format<8>("{}", high), muted_text,
+              Align::RIGHT);
+        for(int index = 0; index < rating_plot_slices; ++index)
+        {
+            bn::sprite_tiles_item tiles(rating_tiles[index], bn::bpp_mode::BPP_4);
+            bn::sprite_item item(bn::sprite_shape_size(64, 64), tiles, bn::sprite_items::marks.palette_item());
+            chart.push_back(make_sprite(item, 2));
+            chart.back().set_bg_priority(0);
+            position(chart.back(), rating_plot_left + 32 + index * 64, origin_y + 32);
+            chart.back().set_visible(true);
+        }
+    }
+
+    void menu_option(int x, int y, const bn::string_view& value, bool focused, Align align = Align::CENTER)
+    {
+        label(menu_text, x, y, value, focused ? gold_text : mint_text, align);
+        if(focused)
+        {
+            int left = align == Align::CENTER ? x - text.width(value) / 2 : x;
+            label(menu_text, left - 9, y, ">", gold_text, Align::LEFT);
+        }
     }
 
     void status(const bn::string_view& message, const bn::string_view& action = {})
@@ -1053,9 +1736,20 @@ private:
         text.set_z_order(0);
     }
 
+    void clear_panel_contents()
+    {
+        portrait.reset();
+        panel_detail.reset();
+        chart.clear();
+        loadout_frames.clear();
+        cue_stats.reset();
+        panel_text.clear();
+        menu_text.clear();
+    }
+
     void open_panel(bool pause_layout = false)
     {
-        panel_text.clear();
+        clear_panel_contents();
         if(aim_backdrop)
         {
             hide_match_hud();
@@ -1135,15 +1829,36 @@ private:
         }
     }
 
-    void hide_sprites()
+    void create_match_sprites()
     {
-        hide_playfield();
-        hide_match_hud();
+        if(! balls.empty())
+        {
+            return;
+        }
+        for(int id = 0; id < 16; ++id)
+        {
+            bn::sprite_tiles_item tiles(sphere_tiles[id], bn::bpp_mode::BPP_4);
+            bn::sprite_item sphere(bn::sprite_shape_size(sphere_sprite_size, sphere_sprite_size),
+                                   tiles, ball_items[id]->palette_item());
+            balls.push_back(make_sprite(sphere, 0));
+            shadows.push_back(make_sprite(bn::sprite_items::marks, 6));
+        }
+        for(int id = 0; id < 14; ++id)
+        {
+            group_balls.push_back(make_sprite(*ball_items[1], 0));
+            group_balls.back().set_bg_priority(0);
+        }
+        for(int i = 0; i < 2; ++i)
+        {
+            avatars.push_back(make_sprite(bn::sprite_items::avatars, 0, i));
+            avatars.back().set_bg_priority(0);
+        }
     }
 
     void hide_match_hud()
     {
         match_hud.reset();
+        show_taunt(-1, Banter::intro);
         hud.clear();
         footer.clear();
         for(bn::sprite_ptr& ball : group_balls)
@@ -1169,7 +1884,7 @@ class Game
 public:
     Game()
     {
-        view.show_lobby(records.profile());
+        view.show_lobby(records.career(), title_focus);
     }
 
     void tick()
@@ -1184,22 +1899,19 @@ public:
         switch(screen)
         {
             case Screen::lobby:
-                if(bn::keypad::a_pressed() || bn::keypad::start_pressed())
-                {
-                    start_match();
-                }
-                else if(bn::keypad::b_pressed())
-                {
-                    cable.open();
-                    screen = Screen::link_wait;
-                    view.show_menu();
-                    view.link_status("LINK CABLE", "WAITING FOR A FRIEND", "OPEN LINK ON BOTH GBAS", "B  BACK");
-                }
-                else if(bn::keypad::select_pressed())
-                {
-                    screen = Screen::help;
-                    view.controls(false);
-                }
+                title_input();
+                break;
+            case Screen::roster:
+                choose_rival();
+                break;
+            case Screen::record:
+                record_input();
+                break;
+            case Screen::gear:
+                gear_input();
+                break;
+            case Screen::collection:
+                collection_input();
                 break;
             case Screen::help:
                 if(bn::keypad::a_pressed() || bn::keypad::b_pressed() || bn::keypad::select_pressed())
@@ -1215,45 +1927,14 @@ public:
                         set_phase(Phase::aim);
                     }
                     screen = Screen::pause;
+                    menu_focus = 0;
                     show_pause();
                     break;
                 }
                 play();
                 break;
             case Screen::pause:
-                if(bn::keypad::a_pressed() || bn::keypad::start_pressed())
-                {
-                    screen = Screen::match;
-                    view.clear_panel();
-                    score();
-                    last_guide = -1;
-                    draw_table();
-                }
-                else if(bn::keypad::b_pressed())
-                {
-                    screen = Screen::concede;
-                    view.concession(linked());
-                }
-                else if(bn::keypad::up_pressed() || bn::keypad::down_pressed())
-                {
-                    full_match_hud = ! full_match_hud;
-                    show_pause();
-                }
-                else if(phase == Phase::aim && ! finding_lines && suggestions.size() &&
-                        (bn::keypad::l_pressed() || bn::keypad::r_pressed()))
-                {
-                    int change = int(bn::keypad::r_pressed()) - int(bn::keypad::l_pressed());
-                    if(change)
-                    {
-                        cycle_pocket_line(change);
-                        show_pause();
-                    }
-                }
-                else if(bn::keypad::select_pressed())
-                {
-                    screen = Screen::pause_help;
-                    view.controls(true);
-                }
+                pause_input();
                 break;
             case Screen::pause_help:
                 if(bn::keypad::a_pressed() || bn::keypad::b_pressed() || bn::keypad::select_pressed() ||
@@ -1264,13 +1945,25 @@ public:
                 }
                 break;
             case Screen::concede:
-                if(bn::keypad::a_pressed())
+                if(menu_axis())
+                {
+                    menu_focus = 1 - menu_focus;
+                    view.confirm_options(linked(), menu_focus);
+                }
+                else if(bn::keypad::b_pressed() || (bn::keypad::a_pressed() && menu_focus == 1))
+                {
+                    screen = Screen::pause;
+                    menu_focus = 4;
+                    show_pause();
+                }
+                else if(bn::keypad::a_pressed())
                 {
                     if(linked())
                     {
                         cable.leave();
                         leave_at = frame + 24;
                         screen = Screen::link_leaving;
+                        view.release_match_sprites();
                         view.link_status("LINK CABLE", "LEAVING MATCH", "", "");
                     }
                     else
@@ -1278,28 +1971,36 @@ public:
                         complete(false, "MATCH CONCEDED");
                     }
                 }
-                else if(bn::keypad::b_pressed())
-                {
-                    screen = Screen::pause;
-                    show_pause();
-                }
                 break;
             case Screen::result:
-                if(linked() && cable.sending() && ! cable.lost())
+                if(linked())
                 {
-                    break;
+                    if((! cable.sending() || cable.lost()) && (bn::keypad::b_pressed() || bn::keypad::a_pressed()))
+                    {
+                        lobby();
+                    }
                 }
-                if(bn::keypad::b_pressed() || (linked() && bn::keypad::a_pressed()))
+                else if(menu_axis())
                 {
-                    lobby();
+                    menu_focus = 1 - menu_focus;
+                    view.result_options(menu_focus, next_rival_unlocked);
+                }
+                else if(bn::keypad::b_pressed() || (bn::keypad::a_pressed() && menu_focus == 1))
+                {
+                    roster_index = result_roster_index;
+                    open_roster();
                 }
                 else if(bn::keypad::a_pressed())
                 {
+                    if(next_rival_unlocked)
+                    {
+                        match_rival = result_roster_index;
+                    }
                     start_match();
                 }
                 break;
             case Screen::link_wait:
-                if(bn::keypad::b_pressed())
+                if(bn::keypad::b_pressed() || bn::keypad::a_pressed())
                 {
                     lobby();
                 }
@@ -1350,10 +2051,38 @@ private:
     bool finding_lines = false;
     int aim_hold = 0;
     int previous_aim_input = 0;
+    DirectionRepeat side_spin_repeat;
+    DirectionRepeat vertical_spin_repeat;
     int charge = 0;
+    int charge_fraction = 0;
     int hold = 0;
     int timer = 0;
     int match_rival = 0;
+    int result_roster_index = 0;
+    bool next_rival_unlocked = false;
+    int roster_index = 0;
+    int gear_cursor = 0;
+    int menu_focus = 0;
+    int title_focus = 0;
+    int local_shots = 0;
+    bool local_power_spent = false;
+    bool rival_power_spent = false;
+    bool rival_reaching = false;
+    int bank_guides_left = 0;
+    int rival_bank_shots_used = 0;
+    CueAbility armed_power = CueAbility::none;
+    PotCombo pot_combos[2];
+    bool saved_turn = false;
+    bool force_placing = false;
+    Vec force_origin;
+    int taunt_life = 0;
+    Banter active_taunt = Banter::intro;
+    int taunt_cooldown = 0;
+    bool shot_started_on_eight = false;
+    bool clothing = false;
+    bool cue_details = false;
+    int history_offset = 0;
+    RecordPage record_page = RecordPage::rating;
     int sound_cooldown = 0;
     uint16_t last_pots = 0;
     CableMatch cable;
@@ -1364,35 +2093,332 @@ private:
     int pending_speed = 0;
 
     bool linked() const { return cable.paired(); }
+    int ranked_cue() const { return linked() ? 0 : records.career().equipped; }
+    int shooting_cue() const { return ! linked() && game.player ? match_rival + 1 : ranked_cue(); }
     int local_player() const { return linked() ? cable.player() : 0; }
 
     const Rival& rival() const { return rivals[match_rival]; }
+    CueAbility rival_ability() const { return cues[match_rival + 1].ability; }
+
+    static int menu_horizontal()
+    {
+        return int(bn::keypad::right_pressed()) - int(bn::keypad::left_pressed());
+    }
+
+    static int menu_vertical()
+    {
+        return int(bn::keypad::down_pressed()) - int(bn::keypad::up_pressed());
+    }
+
+    static int menu_axis()
+    {
+        int vertical = menu_vertical();
+        return vertical ? vertical : menu_horizontal();
+    }
+
+    void title_input()
+    {
+        if(menu_axis())
+        {
+            title_focus ^= menu_vertical() ? 2 : 1;
+            view.title_options(title_focus);
+            return;
+        }
+        if(bn::keypad::start_pressed())
+        {
+            match_rival = records.career().rival_index();
+            start_match();
+            return;
+        }
+        if(bn::keypad::select_pressed())
+        {
+            screen = Screen::help;
+            view.controls(false);
+            return;
+        }
+
+        int action = title_focus;
+        if(bn::keypad::b_pressed())
+        {
+            action = 3;
+        }
+        else if(bn::keypad::l_pressed())
+        {
+            action = 2;
+        }
+        else if(! bn::keypad::a_pressed())
+        {
+            return;
+        }
+        switch(action)
+        {
+            case 0:
+                roster_index = records.career().rival_index();
+                open_roster();
+                break;
+            case 1:
+                screen = Screen::record;
+                record_page = RecordPage::rating;
+                history_offset = 0;
+                view.show_menu();
+                view.show_record(records.career(), record_page, history_offset);
+                break;
+            case 2:
+                view.show_menu();
+                open_gear();
+                break;
+            case 3:
+                cable.open();
+                screen = Screen::link_wait;
+                view.show_menu();
+                view.link_status("LINK CABLE", "WAITING FOR A FRIEND", "OPEN LINK ON BOTH GBAS", "A / B TITLE");
+                break;
+            default: break;
+        }
+    }
+
+    void gear_input()
+    {
+        if(bn::keypad::b_pressed())
+        {
+            lobby();
+        }
+        else if(menu_axis())
+        {
+            menu_focus = 1 - menu_focus;
+            view.gear_options(menu_focus);
+        }
+        else if(bn::keypad::a_pressed() || bn::keypad::l_pressed() || bn::keypad::r_pressed())
+        {
+            screen = Screen::collection;
+            select_collection(bn::keypad::r_pressed() || (! bn::keypad::l_pressed() && menu_focus == 1));
+            view.show_collection(records.career(), gear_cursor, clothing, cue_details);
+        }
+    }
+
+    int pause_lines() const
+    {
+        return phase == Phase::aim && ! finding_lines ? suggestions.size() : 0;
+    }
+
+    void pause_input()
+    {
+        int vertical = menu_vertical();
+        if(vertical)
+        {
+            do
+            {
+                menu_focus = (menu_focus + vertical + 5) % 5;
+            } while(menu_focus == 2 && ! pause_lines());
+            show_pause();
+            return;
+        }
+
+        bool confirm = bn::keypad::a_pressed();
+        int horizontal = menu_horizontal();
+        int shoulder = int(bn::keypad::r_pressed()) - int(bn::keypad::l_pressed());
+        if(bn::keypad::start_pressed() || bn::keypad::b_pressed() || (confirm && menu_focus == 0))
+        {
+            screen = Screen::match;
+            view.clear_panel();
+            score();
+            if(taunt_life)
+            {
+                view.show_taunt(match_rival, active_taunt);
+            }
+            last_guide = -1;
+            draw_table();
+        }
+        else if(confirm && menu_focus == 4)
+        {
+            screen = Screen::concede;
+            menu_focus = 0;
+            view.concession(linked());
+        }
+        else if(bn::keypad::select_pressed() || (confirm && menu_focus == 3))
+        {
+            screen = Screen::pause_help;
+            view.controls(true);
+        }
+        else if(menu_focus == 1 && (confirm || horizontal))
+        {
+            full_match_hud = ! full_match_hud;
+            show_pause();
+        }
+        else if(pause_lines() && (shoulder || (menu_focus == 2 && (confirm || horizontal))))
+        {
+            int direction = shoulder ? shoulder : horizontal;
+            cycle_pocket_line(direction ? direction : 1);
+            show_pause();
+        }
+    }
 
     void lobby()
     {
         cable.close();
         screen = Screen::lobby;
-        view.show_lobby(records.profile());
+        menu_focus = 0;
+        view.show_lobby(records.career(), title_focus);
+    }
+
+    void open_roster()
+    {
+        screen = Screen::roster;
+        menu_focus = 0;
+        view.show_menu();
+        view.show_roster(records.career(), roster_index);
+    }
+
+    void open_gear()
+    {
+        screen = Screen::gear;
+        menu_focus = 0;
+        view.show_loadout(records.career(), menu_focus);
+    }
+
+    void select_collection(bool outfits)
+    {
+        clothing = outfits;
+        cue_details = false;
+        menu_focus = 0;
+        int outfit = records.career().outfit;
+        gear_cursor = outfits ? (outfit ? outfit - 1 : sunglasses) : records.career().equipped;
+    }
+
+    void choose_rival()
+    {
+        const Career& career = records.career();
+        bool unlocked = roster_index <= career.rival_index();
+        if(bn::keypad::b_pressed())
+        {
+            lobby();
+        }
+        else if(int change = menu_horizontal())
+        {
+            roster_index = (roster_index + change + rival_count) % rival_count;
+            view.show_roster(career, roster_index);
+        }
+        else if(bn::keypad::a_pressed())
+        {
+            if(unlocked)
+            {
+                match_rival = roster_index;
+                start_match();
+            }
+            else
+            {
+                bn::sound_items::reject.play(bn::fixed(0.4));
+            }
+        }
+    }
+
+    void collection_input()
+    {
+        if(bn::keypad::b_pressed())
+        {
+            open_gear();
+            return;
+        }
+        if(bn::keypad::l_pressed() || bn::keypad::r_pressed())
+        {
+            select_collection(! clothing);
+        }
+        else if(int change = menu_horizontal())
+        {
+            int count = clothing ? accessory_count : cue_count;
+            gear_cursor = (gear_cursor + change + count) % count;
+            if(! gear_cursor)
+            {
+                cue_details = false;
+            }
+        }
+        else if(bn::keypad::select_pressed() && ! clothing && gear_cursor)
+        {
+            cue_details = ! cue_details;
+        }
+        else if(bn::keypad::a_pressed())
+        {
+            if(! records.collection_action(gear_cursor, clothing))
+            {
+                return;
+            }
+            bn::sound_items::confirm.play(bn::fixed(0.35));
+        }
+        else
+        {
+            return;
+        }
+        view.show_collection(records.career(), gear_cursor, clothing, cue_details);
+    }
+
+    void record_input()
+    {
+        if(bn::keypad::b_pressed())
+        {
+            lobby();
+            return;
+        }
+        int page_change = menu_horizontal();
+        if(! page_change)
+        {
+            page_change = int(bn::keypad::r_pressed()) - int(bn::keypad::l_pressed());
+        }
+        if(page_change)
+        {
+            record_page = RecordPage((int(record_page) + page_change + 3) % 3);
+        }
+        else if(bn::keypad::select_pressed())
+        {
+            record_page = record_page == RecordPage::badges ? RecordPage::rating : RecordPage::badges;
+        }
+        else if(record_page == RecordPage::history)
+        {
+            int direction = int(bn::keypad::down_pressed()) - int(bn::keypad::up_pressed());
+            int max_offset = std::max(0, ((records.career().count - 1) / matches_per_page) * matches_per_page);
+            int offset = std::clamp(history_offset + direction * matches_per_page, 0, max_offset);
+            if(history_offset == offset)
+            {
+                return;
+            }
+            history_offset = offset;
+        }
+        else
+        {
+            return;
+        }
+        view.show_record(records.career(), record_page, history_offset);
     }
 
     void disconnect()
     {
         cable.close();
         screen = Screen::link_lost;
+        view.release_match_sprites();
         view.link_status("LINK ENDED", "FRIEND DISCONNECTED", "", "A / B  LOBBY");
     }
 
     void start_match()
     {
         screen = Screen::match;
-        match_rival = records.profile().rival_index();
         seed ^= frame * 0x9e3779b9u;
         int breaker = linked() ? 0 : (records.profile().wins + records.profile().losses) & 1;
         turn_index = 0;
         game.start(breaker);
         angle = 0;
         view.show_room(prefer_close_view);
+        local_shots = 0;
+        local_power_spent = rival_power_spent = false;
+        bank_guides_left = 0;
+        rival_bank_shots_used = 0;
+        armed_power = CueAbility::none;
+        pot_combos[0] = {};
+        pot_combos[1] = {};
+        saved_turn = false;
+        force_placing = false;
+        taunt_life = 0;
+        taunt_cooldown = 0;
         prepare_turn();
+        taunt(Banter::intro);
         draw_table();
         bn::sound_items::confirm.play(bn::fixed(0.45));
     }
@@ -1400,39 +2426,140 @@ private:
     void complete(bool won, const char* reason)
     {
         screen = Screen::result;
-        view.clear_aim();
+        menu_focus = 0;
+        view.release_match_sprites();
         if(linked())
         {
             view.link_result(won, reason);
         }
         else
         {
-            int change = records.add_result(won, rival().rating);
-            int unlocked = records.profile().rival_index();
-            view.result(won, reason, records.profile(), change, unlocked > match_rival ? unlocked : -1);
+            int previous_unlock = records.career().rival_index();
+            MatchReward reward = records.add_result(won, match_rival, local_shots);
+            int unlocked = records.career().rival_index();
+            bool new_unlock = unlocked > previous_unlock;
+            next_rival_unlocked = new_unlock;
+            result_roster_index = new_unlock ? unlocked : match_rival;
+            view.result(won, reason, records.career(), reward, new_unlock ? unlocked : -1, match_rival);
         }
         bn::sound_items::confirm.play(bn::fixed(0.55));
     }
 
     void show_pause()
     {
-        int lines = phase == Phase::aim && ! finding_lines ? suggestions.size() : 0;
-        view.pause(linked(), full_match_hud, lines, selected_line);
+        view.pause(linked(), full_match_hud, pause_lines(), selected_line, menu_focus);
     }
 
     void score()
     {
-        view.scoreboard(game, records.profile(), rival(), phase, finding_lines ? 0 : suggestions.size(), selected_line,
-                        linked() ? cable.player() : -1, called_pocket, call_cursor, full_match_hud, spin);
+        view.scoreboard(game, records.profile(), match_rival, phase, finding_lines ? 0 : suggestions.size(), selected_line,
+                        linked() ? cable.player() : -1, called_pocket, call_cursor, full_match_hud, spin, force_placing,
+                        local_power_hint());
+    }
+
+    const char* local_power_hint() const
+    {
+        CueAbility cue = cues[ranked_cue()].ability;
+        if(phase != Phase::aim || cue == CueAbility::none)
+        {
+            return nullptr;
+        }
+        if(bank_guides_left)
+        {
+            if(spin.side)
+            {
+                return "ICE BANK / CENTER SIDESPIN";
+            }
+            if(prefer_close_view)
+            {
+                return "ICE BANK / SELECT FOR GUIDE";
+            }
+            return bank_guides_left > 1 ? "ICE BANK / 2 SHOTS LEFT" : "ICE BANK / 1 SHOT LEFT";
+        }
+        if(armed_power == CueAbility::tailspin)
+        {
+            return "TAILSPIN ARMED";
+        }
+        if(armed_power == CueAbility::surge)
+        {
+            return "SURGE ARMED";
+        }
+        if(saved_turn)
+        {
+            return "RIVER RUN / EXTRA SHOT";
+        }
+        const PotCombo& combo = pot_combos[0];
+        if(combo.active())
+        {
+            return combo.ready() ? "RIVER RUN / MISS COVERED" : "RIVER RUN / POT TO ARM";
+        }
+        if(local_power_spent || game.breaking || (cue == CueAbility::pot_combo && game.requires_call()))
+        {
+            return nullptr;
+        }
+        switch(cue)
+        {
+            case CueAbility::bank_read: return "L + R  ICE BANK";
+            case CueAbility::pot_combo: return "L + R  RIVER RUN";
+            case CueAbility::move_cue: return "L + R  LONG REACH";
+            case CueAbility::tailspin: return "L + R  TAILSPIN";
+            case CueAbility::surge: return "L + R  SURGE";
+            default: return nullptr;
+        }
+    }
+
+    void activate_power()
+    {
+        CueAbility cue = cues[ranked_cue()].ability;
+        if(cue == CueAbility::none || local_power_spent || game.breaking ||
+           (cue == CueAbility::pot_combo && game.requires_call()))
+        {
+            return;
+        }
+        if(cue == CueAbility::move_cue)
+        {
+            Vec current = game.table.balls[0].pos;
+            placement = { ((current.x + unit / 2) / unit) * unit, ((current.y + unit / 2) / unit) * unit };
+            force_origin = placement;
+            force_placing = true;
+            set_phase(Phase::place);
+        }
+        else
+        {
+            local_power_spent = true;
+            if(cue == CueAbility::bank_read)
+            {
+                bank_guides_left = ice_bank_shots;
+            }
+            armed_power = cue;
+            if(cue == CueAbility::tailspin && ! spin.side && ! spin.vertical)
+            {
+                spin.vertical = -2;
+            }
+            if(cue == CueAbility::pot_combo)
+            {
+                pot_combos[0].arm();
+            }
+            last_guide = -1;
+            score();
+        }
+        bn::sound_items::confirm.play(bn::fixed(0.38));
     }
 
     void set_phase(Phase value)
     {
+        bool keep_aim_input = (phase == Phase::aim && value == Phase::charge) ||
+                              (phase == Phase::charge && value == Phase::aim);
         phase = value;
         timer = 0;
         last_guide = -1;
-        aim_hold = 0;
-        previous_aim_input = 0;
+        if(! keep_aim_input)
+        {
+            aim_hold = 0;
+            previous_aim_input = 0;
+            side_spin_repeat = {};
+            vertical_spin_repeat = {};
+        }
         hold = 0;
         if(phase != Phase::charge && phase != Phase::rolling)
         {
@@ -1464,6 +2591,7 @@ private:
 
     void prepare_turn()
     {
+        view.set_equipment(shooting_cue(), linked() ? 0 : records.career().outfit);
         placed_for_link = false;
         called_pocket = -1;
         spin = {};
@@ -1478,7 +2606,22 @@ private:
         }
         else if(game.player)
         {
-            planner.start(game, match_rival);
+            rival_reaching = false;
+            if(! game.breaking && ! rival_power_spent)
+            {
+                if(rival_ability() == CueAbility::move_cue && ! game.ball_in_hand)
+                {
+                    rival_reaching = true;
+                    game.ball_in_hand = true;
+                }
+                else if(rival_ability() == CueAbility::pot_combo && ! game.requires_call())
+                {
+                    rival_power_spent = true;
+                    pot_combos[1].arm();
+                    rival_power();
+                }
+            }
+            planner.start(game, match_rival, cue_shot_speed(match_rival + 1, max_speed));
             set_phase(Phase::cpu_wait);
             return;
         }
@@ -1556,20 +2699,25 @@ private:
         selected_line = selected_line < 0 ? 0 : (selected_line + change + count) % count;
         const Plan& choice = suggestions[selected_line];
         angle = choice.angle;
-        aim_power = choice.speed;
+        int power_scale = cue_shot_speed(ranked_cue(), 100);
+        aim_power = std::clamp((choice.speed * 100 + power_scale / 2) / power_scale, min_speed, max_speed);
         spin = {};
     }
 
     void spin_input()
     {
-        int horizontal = int(bn::keypad::right_pressed()) - int(bn::keypad::left_pressed());
-        int vertical = int(bn::keypad::up_pressed()) - int(bn::keypad::down_pressed());
+        int horizontal = side_spin_repeat.step(int(bn::keypad::right_held()) - int(bn::keypad::left_held()));
+        int vertical = vertical_spin_repeat.step(int(bn::keypad::up_held()) - int(bn::keypad::down_held()));
         CueSpin next{ std::clamp(spin.side + horizontal, -max_spin, max_spin),
                       std::clamp(spin.vertical + vertical, -max_spin, max_spin) };
         if(next.side != spin.side || next.vertical != spin.vertical)
         {
             spin = next;
             selected_line = -1;
+            if(bank_guides_left)
+            {
+                last_guide = -1;
+            }
             score();
         }
     }
@@ -1617,8 +2765,48 @@ private:
 
     void strike(int speed, int pocket, CueSpin shot_spin = {})
     {
+        shot_started_on_eight = game.requires_call();
         shot_origin = game.table.balls[0].pos;
-        game.table.strike(direction(angle), speed, pocket, shot_spin);
+        bool local_ranked = ! linked() && game.player == 0;
+        if(local_ranked)
+        {
+            ++local_shots;
+        }
+        if(local_ranked && bank_guides_left)
+        {
+            --bank_guides_left;
+        }
+        saved_turn = false;
+        int cue = shooting_cue();
+        if(local_ranked)
+        {
+            speed = cue_shot_speed(cue, speed);
+        }
+        int spin_strength = cue_spin_strength(cue);
+        CueAbility ability = armed_power;
+        armed_power = CueAbility::none;
+        if(! linked() && game.player && ! game.breaking && ! rival_power_spent &&
+           ((rival_ability() == CueAbility::tailspin && ! game.requires_call()) ||
+            (rival_ability() == CueAbility::surge && speed >= 360 && ! game.requires_call() &&
+             ! planner.has_verified_pot())))
+        {
+            ability = rival_ability();
+            rival_power_spent = true;
+            rival_power();
+            if(ability == CueAbility::tailspin)
+            {
+                shot_spin.vertical = -2;
+            }
+        }
+        if(ability == CueAbility::tailspin)
+        {
+            spin_strength = (spin_strength * (100 + tailspin_bonus) + 50) / 100;
+        }
+        if(ability == CueAbility::surge)
+        {
+            speed = (speed * (100 + surge_bonus) + 50) / 100;
+        }
+        game.table.strike(direction(angle), speed, pocket, shot_spin, spin_strength);
         charge = speed;
         last_pots = 0;
         sound_cooldown = 0;
@@ -1638,7 +2826,10 @@ private:
         {
             int amount = aim_step(aim_hold);
             angle = view.limit_aim_angle((angle + input * amount) & (angle_count - 1));
-            ++aim_hold;
+            if(aim_hold < aim_full_speed)
+            {
+                ++aim_hold;
+            }
             if(amount && selected_line >= 0)
             {
                 selected_line = -1;
@@ -1649,6 +2840,12 @@ private:
 
     void place_ball()
     {
+        if(force_placing && bn::keypad::b_pressed())
+        {
+            force_placing = false;
+            set_phase(Phase::aim);
+            return;
+        }
         int x = int(bn::keypad::right_held()) - int(bn::keypad::left_held());
         int y = int(bn::keypad::down_held()) - int(bn::keypad::up_held());
         hold = (x || y) ? hold + 1 : 0;
@@ -1657,12 +2854,18 @@ private:
         placement.y = std::clamp(placement.y + y * pace, top, bottom);
         if(bn::keypad::a_pressed())
         {
-            if(! game.table.can_place(placement))
+            if(! game.table.can_place(placement) || (force_placing && placement.x == force_origin.x && placement.y == force_origin.y))
             {
                 bn::sound_items::reject.play(bn::fixed(0.45));
                 return;
             }
             // Link packets use whole-pixel positions. The placement preview moves on that grid.
+            if(force_placing)
+            {
+                local_power_spent = true;
+                force_placing = false;
+                called_pocket = -1;
+            }
             game.table.place_cue(placement);
             link_placement = placement;
             placed_for_link = true;
@@ -1670,6 +2873,27 @@ private:
             prepare_aim();
             bn::sound_items::confirm.play(bn::fixed(0.32));
         }
+    }
+
+    void rival_power(Banter event = Banter::ability)
+    {
+        display_taunt(event, 140);
+    }
+
+    void taunt(Banter event)
+    {
+        if(! linked() && ! taunt_cooldown)
+        {
+            display_taunt(event, event == Banter::intro ? 60 : 140);
+        }
+    }
+
+    void display_taunt(Banter event, int cooldown)
+    {
+        active_taunt = event;
+        view.show_taunt(match_rival, event);
+        taunt_life = 112;
+        taunt_cooldown = cooldown;
     }
 
     void roll()
@@ -1692,10 +2916,40 @@ private:
         }
         if(! moving)
         {
-            game.finish_shot();
+            int shooter = game.player;
+            bool human = shooter == local_player();
+            bool combo_saved = game.finish_shot(&pot_combos[shooter]);
+            saved_turn = combo_saved && human;
+            if(combo_saved)
+            {
+                bn::sound_items::confirm.play(bn::fixed(0.38));
+                if(! human)
+                {
+                    rival_power(Banter::combo_saved);
+                }
+            }
             ++turn_index;
             if(game.outcome == Outcome::playing)
             {
+                if(game.ball_in_hand)
+                {
+                    taunt(human ? Banter::player_foul : Banter::rival_foul);
+                }
+                else if(game.player == local_player() && ! (human && shot_started_on_eight) && game.requires_call())
+                {
+                    taunt(Banter::on_eight);
+                }
+                else if(game.potted_group(Group::open))
+                {
+                    if(game.potted_group(game.groups[shooter]))
+                    {
+                        taunt(human ? Banter::player_pot : Banter::rival_pot);
+                    }
+                    else
+                    {
+                        taunt(human ? Banter::player_helped_me : Banter::i_helped_you);
+                    }
+                }
                 prepare_turn();
             }
             else
@@ -1711,15 +2965,30 @@ private:
     void play()
     {
         ++timer;
+        if(taunt_life && ! --taunt_life)
+        {
+            view.show_taunt(-1, Banter::intro);
+        }
+        if(taunt_cooldown)
+        {
+            --taunt_cooldown;
+        }
         if(phase != Phase::place && phase != Phase::call && bn::keypad::select_pressed())
         {
             prefer_close_view = ! prefer_close_view;
             last_guide = -1;
+            score();
         }
         switch(phase)
         {
             case Phase::aim:
                 update_suggestions();
+                if(bn::keypad::l_held() && bn::keypad::r_held() &&
+                   (bn::keypad::l_pressed() || bn::keypad::r_pressed()))
+                {
+                    activate_power();
+                    break;
+                }
                 steer();
                 spin_input();
                 if(called_pocket >= 0 && bn::keypad::b_pressed())
@@ -1736,6 +3005,7 @@ private:
                 else if(bn::keypad::a_pressed())
                 {
                     charge = aim_power;
+                    charge_fraction = 0;
                     set_phase(Phase::charge);
                 }
                 break;
@@ -1758,7 +3028,9 @@ private:
                     spin_input();
                     if(timer > 6)
                     {
-                        charge = std::min(max_speed, charge + (timer < 24 ? 5 : 8));
+                        charge_fraction += (timer < 24 ? 5 : 8) * cue_charge_rate(ranked_cue());
+                        charge = std::min(max_speed, charge + charge_fraction / 100);
+                        charge_fraction %= 100;
                     }
                 }
                 break;
@@ -1775,8 +3047,21 @@ private:
                 if(planner.advance(game, seed) && timer >= 32)
                 {
                     cpu_plan = planner.result();
+                    if(rival_ability() == CueAbility::bank_read && rival_bank_shots_used < ice_bank_shots && ! game.breaking &&
+                       game.table.trace(cpu_plan.placement, direction(planner.planned_angle()), 0).rail)
+                    {
+                        cpu_plan.angle = planner.planned_angle();
+                        ++rival_bank_shots_used;
+                        rival_power();
+                    }
                     if(game.ball_in_hand)
                     {
+                        if(rival_reaching && length(cpu_plan.placement - game.table.balls[0].pos) >= unit)
+                        {
+                            rival_power_spent = true;
+                            rival_power();
+                        }
+                        rival_reaching = false;
                         game.table.place_cue(cpu_plan.placement);
                         game.ball_in_hand = false;
                     }
@@ -1838,8 +3123,12 @@ private:
                      phase == Phase::cpu_aim ? cpu_plan.pocket :
                      phase == Phase::rolling ? game.table.shot.called_pocket :
                      phase == Phase::aim || phase == Phase::charge ? called_pocket : -1;
-        bool hold_camera = phase == Phase::rolling || phase == Phase::cpu_wait || phase == Phase::cpu_aim ||
-                           phase == Phase::remote || phase == Phase::link_send;
+        bool remote_shot_playing = linked() && game.player != local_player();
+        bool hold_camera = (phase == Phase::rolling && ! remote_shot_playing) || phase == Phase::link_send;
+        if(phase == Phase::cpu_aim && use_close_view)
+        {
+            heading = cpu_plan.angle;
+        }
         if(! view.update_camera(focus, heading, use_close_view, pocket, hold_camera))
         {
             return;
@@ -1874,7 +3163,7 @@ private:
                 {
                     if(! use_close_view)
                     {
-                        view.trajectory(game, displayed);
+                        view.trajectory(game, displayed, ! spin.side && bank_guides_left);
                     }
                     last_guide = displayed;
                 }
@@ -1890,9 +3179,10 @@ private:
                 break;
             case Phase::cpu_aim:
                 view.clear_aim();
-                if(! use_close_view)
+                if(! use_close_view || ! view.camera_settling())
                 {
-                    view.draw_cue(game.table, angle, std::clamp((timer - 12) / 2, 0, 12));
+                    int displayed = use_close_view ? view.displayed_angle() : angle;
+                    view.draw_cue(game.table, displayed, std::clamp((timer - 12) / 2, 0, 12));
                 }
                 break;
             case Phase::rolling:

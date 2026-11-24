@@ -41,11 +41,9 @@ struct CameraPoint
 
 constexpr int move_pocket_call(int pocket, int horizontal, int vertical)
 {
-    constexpr int clockwise[] = { 0, 1, 2, 5, 4, 3 };
     if(horizontal)
     {
-        int index = pocket < 3 ? pocket : 8 - pocket;
-        return clockwise[(index + horizontal + 6) % 6];
+        return (pocket / 3) * 3 + (pocket % 3 + horizontal + 3) % 3;
     }
     return vertical ? (pocket + 3) % 6 : pocket;
 }

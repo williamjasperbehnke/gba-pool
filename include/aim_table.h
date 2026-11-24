@@ -15,7 +15,7 @@ public:
     void close();
     void hide();
     void commit();
-    void draw(const AimCamera& camera);
+    void draw(const AimCamera& camera, int called_pocket);
     void finish(const AimCamera& camera);
 
 private:

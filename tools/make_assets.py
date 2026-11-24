@@ -6,7 +6,12 @@ import random
 import struct
 import wave
 
-from PIL import Image, ImageChops, ImageDraw
+from PIL import Image, ImageChops, ImageColor, ImageDraw
+
+if __package__:
+    from .pool_portraits import PORTRAIT_PALETTE, character_art, player_outfits
+else:
+    from pool_portraits import PORTRAIT_PALETTE, character_art, player_outfits
 
 ROOT = Path(__file__).resolve().parents[1]
 GRAPHICS = ROOT / "graphics"
@@ -74,7 +79,10 @@ FONT = {
     "8": ("111","101","111","101","111"), "9": ("111","101","111","001","110"),
     "+": ("000","010","111","010","000"), "-": ("000","000","111","000","000"),
     "/": ("001","001","010","100","100"), ">": ("100","010","001","010","100"),
-    ".": ("0","0","0","0","1"), " ": ("00",) * 5,
+    "<": ("001","010","100","010","001"), "%": ("11001","11010","00100","01011","10011"),
+    ".": ("0","0","0","0","1"), ",": ("00","00","00","01","10"),
+    "'": ("1","1","0","0","0"), "?": ("110","001","010","000","010"),
+    " ": ("00",) * 5,
 }
 
 
@@ -205,7 +213,10 @@ def paint_pocket(image, pocket, called=False, offset=(0, 0)):
     draw.polygon(outer, fill=8 if called else LEATHER)
     if not called:
         draw.polygon(outer[4:10], fill=FAR_CUSHION if pocket < 3 else NEAR_CUSHION)
-    draw.line((outer[0], outer[1]), fill=9 if called else TRIM)
+    if called:
+        draw.line(outer + outer[:1], fill=9)
+    else:
+        draw.line((outer[0], outer[1]), fill=TRIM)
     opening = polygon(mouth, 3)
     draw.polygon(opening, fill=7 if called else POCKET_WALL)
     mask = Image.new("1", image.size)
@@ -243,11 +254,16 @@ def pool_room(draw):
 def make_match_hud(compact=False):
     image = indexed((256, 256), [SCENE[i] for i in (0, 1, 5, 3, 4)])
     draw = ImageDraw.Draw(image)
-    bottom = 16 if compact else 26
+    bottom = 16 if compact else 33
     for x0, x1 in ((3, 91), (96, 143), (148, 236)):
-        draw.rounded_rectangle((x0, 2, x1, bottom), 3, fill=3, outline=2)
+        card_bottom = 26 if not compact and x0 == 96 else bottom
+        draw.rounded_rectangle((x0, 2, x1, card_bottom), 3, fill=3, outline=2)
         if not compact:
-            draw.rounded_rectangle((x0 + 2, 4, x1 - 2, 13), 2, fill=1)
+            if x0 == 96:
+                draw.rounded_rectangle((x0 + 2, 4, x1 - 2, 15), 2, fill=1)
+            else:
+                draw.rounded_rectangle((x0 + 2, 3, x0 + 22, 20), 2, fill=1)
+                draw.rounded_rectangle((x0 + 24, 3, x1 - 2, 20), 2, fill=1)
     save(image, "match_hud_compact" if compact else "match_hud", "regular_bg", bpp_mode="bpp_4")
 
 
@@ -300,15 +316,6 @@ def title_art(image, draw, x, y, radius):
             for xx in range(cx - r - 1, cx + r + 2):
                 shade_at(xx, yy, color, r + .6 - math.hypot(xx - cx, yy - cy))
 
-    def rounded_panel(cx, cy, half_width, half_height, r, color):
-        for yy in range(cy - half_height, cy + half_height + 1):
-            for xx in range(cx - half_width, cx + half_width + 1):
-                dx = max(0, abs(xx - cx) - half_width + r)
-                dy = max(0, abs(yy - cy) - half_height + r)
-                shade_at(xx, yy, color, r + .5 - math.hypot(dx, dy))
-
-    rounded_panel(179, 49, 49, 39, 10, 32)
-    rounded_panel(179, 49, 48, 38, 9, 39)
     for yy in range(y + 20, y + 39):
         for xx in range(x - 27, x + 27):
             distance = math.hypot((xx - x - 1) / 26, (yy - y - 29) / 8)
@@ -352,29 +359,94 @@ def title_art(image, draw, x, y, radius):
 
 def make_title():
     image, draw = shell()
-    draw.rounded_rectangle((8, 7, 231, 91), 5, fill=36, outline=5)
-    title_art(image, draw, 179, 45, 32)
-    stamp(draw, "8-BALL POOL", 19, 17, 8, gap=2, centered=False)
-    stamp(draw, "BREAK", 21, 33, 15, scale=5, gap=3, centered=False)
-    stamp(draw, "BREAK", 19, 31, 9, scale=5, gap=3, centered=False)
-    stamp(draw, "ROOM", 21, 62, 15, scale=5, gap=3, centered=False)
-    stamp(draw, "ROOM", 19, 60, 10, scale=5, gap=3, centered=False)
+    draw.rounded_rectangle((8, 7, 231, 86), 5, fill=36, outline=5)
+    draw.line((15, 7, 224, 7), fill=6)
+    draw.rounded_rectangle((130, 12, 225, 81), 6, fill=39, outline=32)
+    draw.rounded_rectangle((133, 15, 222, 78), 3, fill=16)
+    draw.polygon(((138, 18), (186, 18), (210, 74), (161, 74)), fill=39)
+    title_art(image, draw, 179, 43, 29)
 
-    draw.rounded_rectangle((8, 96, 231, 112), 3, fill=36, outline=5)
-    stamp(draw, "RATING", 15, 102, 8, centered=False)
-    draw.line((78, 100, 78, 108), fill=5)
-    draw.line((155, 100, 155, 108), fill=5)
-    for left, right, color, edge in ((8, 116, 17, 23), (124, 231, 3, 6)):
-        draw.rounded_rectangle((left, 119, right, 141), 4, fill=color, outline=edge)
-        draw.line((left+7, 120, right-7, 120), fill=edge)
-    stamp(draw, "A", 18, 128, 10, centered=False)
-    stamp(draw, "RANKED", 34, 128, 9, gap=2, centered=False)
-    stamp(draw, "B", 135, 128, 10, centered=False)
-    stamp(draw, "LINK CABLE", 150, 128, 9, gap=2, centered=False)
-    draw.rounded_rectangle((77, 145, 113, 155), 2, fill=4)
-    stamp(draw, "SELECT", 95, 148, 9)
-    stamp(draw, "CONTROLS", 120, 148, 8, centered=False)
+    stamp(draw, "8-BALL POOL", 19, 17, 8, gap=2, centered=False)
+    draw.line((19, 27, 116, 27), fill=5)
+    stamp(draw, "BREAK", 21, 34, 15, scale=4, gap=3, centered=False)
+    stamp(draw, "BREAK", 19, 32, 9, scale=4, gap=3, centered=False)
+    stamp(draw, "ROOM", 21, 59, 15, scale=4, gap=4, centered=False)
+    stamp(draw, "ROOM", 19, 57, 10, scale=4, gap=4, centered=False)
+
+    draw.rounded_rectangle((8, 91, 231, 105), 3, fill=36, outline=5)
+    stamp(draw, "RATING", 15, 96, 8, centered=False)
+    draw.line((78, 94, 78, 102), fill=5)
+    draw.line((155, 94, 155, 102), fill=5)
+    for top in (110, 129):
+        for left, right in ((8, 117), (123, 231)):
+            draw.rounded_rectangle((left, top, right, top + 15), 3, fill=36, outline=5)
     save(image, "lobby", "regular_bg", bpp_mode="bpp_8")
+
+
+def portrait_sprite(art, size, colors):
+    source = art.resize((size, size), Image.Resampling.BOX)
+    rgb = [ImageColor.getrgb(color) for color in colors]
+    sprite = indexed(source.size, colors)
+    sprite.putdata([
+        min(range(1, len(rgb)), key=lambda i:
+            sum((component - target)**2 for component, target in zip(pixel, rgb[i])))
+        if pixel[3] >= 130 else 0
+        for pixel in source.getdata()
+    ])
+    return sprite
+
+
+def make_rival_portraits():
+    art = character_art()[:5]
+    frames = indexed((64, 64 * (len(art) - 1)), PORTRAIT_PALETTE)
+    icons = indexed((16, 16 * (len(art) - 1)), PORTRAIT_PALETTE)
+    finn_palette = PORTRAIT_PALETTE[:5] + [
+        "#802d3c", "#53232d", "#9e252d", "#cb3535", "#ed5b54", "#e18289",
+        "#c2c8d1", "#88522e", "#e3a347", "#ffdda7", "#fff1de",
+    ]
+    circle_colors = (6, 4, 13, 9, 5)
+    for slot, portrait in enumerate(art):
+        is_finn = slot == len(art) - 1
+        palette = finn_palette if is_finn else PORTRAIT_PALETTE
+        card = indexed((64, 64), palette)
+        draw = ImageDraw.Draw(card)
+        draw.rounded_rectangle((0, 0, 63, 63), 5, fill=1, outline=3)
+        draw.rounded_rectangle((2, 2, 61, 61), 4, fill=2)
+        draw.line((6, 0, 57, 0), fill=4)
+        draw.ellipse((9, 7, 54, 52), fill=circle_colors[slot])
+        inset = portrait_sprite(portrait, 56, palette)
+        mask = Image.new("1", inset.size)
+        mask.putdata([255 if pixel else 0 for pixel in inset.tobytes()])
+        card.paste(inset, (4, 4), mask)
+        icon = portrait_sprite(portrait, 16, palette)
+        if is_finn:
+            save(card, "finn_portrait", "sprite", height=64, bpp_mode="bpp_4")
+            save(icon, "finn_icon", "sprite", height=16, bpp_mode="bpp_4")
+        else:
+            frames.paste(card, (0, 64 * slot))
+            icons.paste(icon, (0, 16 * slot))
+    save(frames, "rival_portraits", "sprite", height=64, bpp_mode="bpp_4")
+    save(icons, "rival_icons", "sprite", height=16, bpp_mode="bpp_4")
+
+
+def make_player_portraits():
+    default = character_art()[-1]
+    outfits = player_outfits()
+    avatars = indexed((16, 16 * 3), INK)
+    cosmetics = indexed((16, 16 * len(outfits)), INK)
+    wardrobe = indexed((64, 64 * (len(outfits) + 1)), PORTRAIT_PALETTE)
+    for frame, jersey in enumerate((15, 7, 13)):
+        icon = portrait_sprite(default, 16, INK)
+        colors = list(range(256))
+        colors[15] = jersey
+        avatars.paste(icon.point(colors), (0, 16 * frame))
+    for frame, outfit in enumerate(outfits):
+        cosmetics.paste(portrait_sprite(outfit, 16, INK), (0, 16 * frame))
+        wardrobe.paste(portrait_sprite(outfit, 54, PORTRAIT_PALETTE), (5, 64 * frame + 5))
+    wardrobe.paste(portrait_sprite(default, 54, PORTRAIT_PALETTE), (5, 64 * len(outfits) + 5))
+    save(avatars, "avatars", "sprite", height=16, bpp_mode="bpp_4")
+    save(cosmetics, "cosmetic_avatars", "sprite", height=16, bpp_mode="bpp_4")
+    save(wardrobe, "wardrobe_portraits", "sprite", height=64, bpp_mode="bpp_4")
 
 
 def make_menu():
@@ -390,8 +462,9 @@ def make_panel(paused=False):
     if paused:
         draw.rounded_rectangle((50, 36, 192, 144), 7, fill=1)
         draw.rounded_rectangle((48, 33, 191, 141), 6, fill=4, outline=2)
-        draw.rounded_rectangle((62, 59, 177, 77), 4, fill=7, outline=6)
-        draw.rounded_rectangle((62, 83, 177, 101), 4, fill=5, outline=2)
+        draw.rounded_rectangle((57, 39, 182, 53), 3, fill=5)
+        for y in (65, 82, 114, 130):
+            draw.rounded_rectangle((60, y - 6, 179, y + 6), 3, fill=5)
     else:
         draw.rounded_rectangle((23, 22, 220, 146), 7, fill=1)
         draw.rounded_rectangle((21, 19, 218, 143), 6, fill=4, outline=2)
@@ -404,6 +477,49 @@ def blend(first, second, ratio):
     channels = (round(int(first[i:i+2], 16) * (1 - ratio) + int(second[i:i+2], 16) * ratio)
                 for i in (1, 3, 5))
     return "#" + "".join(f"{channel:02x}" for channel in channels)
+
+
+def draw_cue_preview(item):
+    art = indexed((64, 64), CUE)
+    draw = ImageDraw.Draw(art)
+
+    def point(distance, across):
+        return round(7 + distance * .70 + across * .71), round(56 - distance * .70 + across * .71)
+
+    def section(lo, hi, left, right, color):
+        draw.polygon((point(lo, -left), point(hi, -right), point(hi, right), point(lo, left)), fill=color)
+
+    # Long tapered maple shaft, slim grip, ivory ferrule and chalked leather tip.
+    section(1, 70, 2.9, 1.0, 1)
+    section(3, 69, 2.3, .75, 5)
+    draw.line((point(4, -1.4), point(67, -.4)), fill=7)
+    section(2, 24, 2.5, 1.8, 12 if item else 10)
+    draw.line((point(3, -1.5), point(23, -1.0)), fill=4)
+    section(1, 3, 2.7, 2.4, 1)
+    section(24, 26, 1.8, 1.7, 11)
+    section(67, 70, 1.0, .95, 13)
+    section(70, 72, .95, .75, 8)
+    draw.point(point(71, -.5), fill=9)
+
+    if item == 1:  # Bamboo binding and nodes.
+        for at in (8, 13, 18, 35, 47, 57):
+            section(at, at + 1, 1.8 if at < 20 else .8, 1.6 if at < 20 else .8, 11)
+    elif item == 2:  # Frost Tip's silver diamonds.
+        for at in (8, 15, 21):
+            draw.polygon((point(at - 2, 0), point(at, -1.6), point(at + 2, 0), point(at, 1.6)), fill=13)
+        draw.line((point(30, 0), point(62, 0)), fill=11)
+    elif item == 3:  # Copper feather inlay.
+        draw.line((point(5, 1), point(17, -1), point(30, 0)), fill=11, width=2)
+        draw.line((point(12, 1), point(24, -.5)), fill=7)
+    elif item == 4:  # Tentacle grip.
+        draw.line((point(6, .7), point(25, -.4)), fill=11, width=2)
+        for at in (8, 14, 20):
+            draw.point(point(at, -.6), fill=13)
+    elif item == 5:  # Ivory with a teal wave at the joint.
+        draw.line((point(4, 0), point(12, -1), point(21, 0), point(28, 1)), fill=4, width=2)
+        for at in (10, 16, 22):
+            draw.point(point(at, -.7), fill=13)
+    return art
 
 
 def make_sprites():
@@ -441,7 +557,7 @@ def make_sprites():
     save(marks, "marks", "sprite", height=8, bpp_mode="bpp_4")
 
     active = indexed((64, 32 * 4), INK)
-    for mode, bottom in enumerate((24, 14)):
+    for mode, bottom in enumerate((31, 14)):
         border = indexed((89, 32), INK)
         draw = ImageDraw.Draw(border)
         draw.rounded_rectangle((0, 0, 88, bottom), 3, outline=8)
@@ -467,51 +583,88 @@ def make_sprites():
     draw.point((3, 3), fill=11)
     save(spin_dot, "spin_dot", "sprite", bpp_mode="bpp_4")
 
-    stick = indexed((64, 32), CUE)
-    draw = ImageDraw.Draw(stick)
-    draw.polygon(((1, 13), (23, 13), (60, 15), (63, 15), (63, 17),
-                  (60, 17), (23, 19), (1, 19), (0, 18), (0, 14)), fill=1)
-    draw.rectangle((2, 14, 24, 18), fill=10)
-    draw.line((2, 14, 23, 14), fill=4)
-    draw.rectangle((6, 14, 20, 18), fill=12)
-    draw.line((7, 15, 19, 15), fill=3)
-    draw.line((7, 17, 19, 17), fill=2)
-    draw.line((3, 14, 3, 18), fill=11)
-    draw.line((21, 14, 21, 18), fill=11)
-    draw.polygon(((25, 14), (58, 15), (58, 17), (25, 18)), fill=6)
-    draw.line((25, 15, 57, 15), fill=7)
-    draw.line((27, 16, 57, 16), fill=5)
-    draw.line((25, 18, 37, 17), fill=10)
-    draw.rectangle((58, 15, 61, 17), fill=7)
-    draw.line((58, 17, 61, 17), fill=6)
-    draw.line((59, 15, 61, 15), fill=13)
-    draw.line((62, 15, 62, 17), fill=8)
-    draw.point((62, 16), fill=9)
-    draw.point((63, 16), fill=9)
-    save(stick, "cue", "sprite", bpp_mode="bpp_4")
+    signatures = indexed((64, 32 * 6), CUE)
+    draw = ImageDraw.Draw(signatures)
+    for style in range(6):
+        y = style * 32 + 16
+        draw.polygon(((0, y - 3), (18, y - 3), (41, y - 2), (62, y - 1), (63, y),
+                      (62, y + 1), (43, y + 2), (18, y + 3), (0, y + 3)), fill=1)
+        draw.polygon(((2, y - 2), (28, y - 2), (58, y - 1), (61, y - 1),
+                      (61, y + 1), (42, y + 1), (24, y + 2), (2, y + 2)), fill=6)
+        draw.line((3, y - 1, 26, y - 1, 40, y, 59, y), fill=5)
+        draw.line((28, y - 2, 58, y - 1), fill=7)
+        draw.rectangle((2, y - 2, 18, y + 2), fill=10 if style == 0 else 12)
+        draw.line((2, y - 2, 18, y - 2), fill=4)
+        draw.line((18, y - 2, 18, y + 2), fill=11)
+        draw.line((21, y - 2, 21, y + 2), fill=3)
+        draw.line((58, y - 1, 61, y - 1), fill=13)
+        draw.line((58, y, 61, y), fill=7)
+        draw.line((62, y - 1, 62, y + 1), fill=8)
+        draw.point((63, y), fill=9)
+        if style == 0:
+            draw.line((5, y, 15, y), fill=3)
+        elif style == 1:
+            for x in (7, 12, 17, 34, 45):
+                draw.line((x, y - 1, x, y + 1), fill=11)
+        elif style == 2:
+            for x in (7, 13, 29):
+                draw.polygon(((x - 1, y), (x, y - 1), (x + 1, y), (x, y + 1)), fill=13)
+            draw.line((31, y, 47, y), fill=11)
+        elif style == 3:
+            draw.line((4, y + 1, 15, y - 1, 26, y), fill=11)
+            draw.line((12, y + 1, 22, y), fill=7)
+        elif style == 4:
+            for x in (5, 10, 15):
+                draw.rectangle((x, y - 1, x + 2, y + 1), fill=11)
+                draw.point((x + 1, y), fill=13)
+        else:
+            draw.line((24, y - 1, 57, y), fill=13)
+            for x in (5, 10, 15):
+                draw.line((x, y - 1, x - 2, y + 1), fill=11)
+    save(signatures, "cue", "sprite", height=32, bpp_mode="bpp_4")
 
-    close_cue = indexed((8, 32 * 64), CUE)
+    cue_previews = indexed((64, 64 * 6), CUE)
+    for item in range(6):
+        cue_previews.paste(draw_cue_preview(item), (0, 64 * item))
+    save(cue_previews, "cue_previews", "sprite", height=64, bpp_mode="bpp_4")
+
+    gear_frame = indexed((64, 64), INK)
+    mat = ImageDraw.Draw(gear_frame)
+    mat.rounded_rectangle((0, 0, 63, 63), 4, fill=2, outline=13)
+    mat.rounded_rectangle((3, 3, 60, 60), 3, fill=1, outline=12)
+    mat.line((7, 3, 56, 3), fill=3)
+    save(gear_frame, "gear_frame", "sprite", bpp_mode="bpp_4")
+
+    close_cue = indexed((8, 32 * 64 * 6), CUE)
     draw = ImageDraw.Draw(close_cue)
-    for section in range(2):
-        for length in range(1, 33):
-            top = (section * 32 + length - 1) * 32
-            for pixel_row in range(length):
-                row = section * 32 + pixel_row
-                y = top + pixel_row
-                if row <= 1:
-                    draw.line((3, y, 5, y), fill=8)
-                    draw.point((4, y), fill=9)
-                elif row <= 5:
-                    draw.line((3, y, 5, y), fill=6)
-                    draw.point((3, y), fill=7)
-                    draw.point((4, y), fill=13 if row < 5 else 7)
-                else:
-                    edge = 1 if row >= 32 else 2 if row >= 15 else 3
-                    draw.line((edge, y, 5, y), fill=6)
-                    draw.point((4, y), fill=5)
-                    draw.point((5, y), fill=3)
-                    if row >= 23:
-                        draw.point((6, y), fill=2)
+    for style in range(6):
+        for section in range(2):
+            for length in range(1, 33):
+                top = (style * 64 + section * 32 + length - 1) * 32
+                for pixel_row in range(length):
+                    row = section * 32 + pixel_row
+                    y = top + pixel_row
+                    if row <= 1:
+                        draw.line((3, y, 5, y), fill=8)
+                        draw.point((4, y), fill=9)
+                    elif row < 7:
+                        draw.line((3, y, 5, y), fill=6)
+                        draw.point((4, y), fill=13)
+                        draw.point((5, y), fill=7)
+                    else:
+                        left = 3 if row < 15 else 2 if row < 33 else 1
+                        right = 5 if row < 24 else 6 if row < 45 else 7
+                        draw.line((left, y, right, y), fill=3)
+                        draw.line((left + 1, y, right - 1, y), fill=6)
+                        draw.point((3, y), fill=7)
+                        draw.point((4, y), fill=13 if style in (2, 5) else 5)
+                        if row >= 43:
+                            draw.line((left + 1, y, right - 1, y), fill=10 if style == 0 else 12)
+                            draw.point((3, y), fill=4)
+                        if row in (39, 42) or (style == 1 and row in (17, 27, 35)):
+                            draw.line((left + 1, y, right - 1, y), fill=11)
+                        if style in (2, 3, 4, 5) and row >= 46 and row % 6 in (0, 1):
+                            draw.point((4, y), fill=13 if style in (2, 4) else 11)
     save(close_cue, "close_cue", "sprite", height=32, bpp_mode="bpp_4")
 
     meter = indexed((8, 8 * 9), INK)
@@ -527,14 +680,22 @@ def make_sprites():
             draw.line((0, y + 5, fill - 1, y + 5), fill=7)
     save(meter, "meter", "sprite", height=8, bpp_mode="bpp_4")
 
-    avatars = indexed((8, 24), INK)
-    draw = ImageDraw.Draw(avatars)
-    for profile, color in enumerate((5, 8, 13)):
-        y = profile * 8
-        draw.rounded_rectangle((0, y, 7, y + 7), 2, fill=2, outline=3)
-        draw.rectangle((3, y + 1, 4, y + 3), fill=color)
-        draw.polygon(((1, y + 6), (2, y + 5), (5, y + 5), (6, y + 6)), fill=color)
-    save(avatars, "avatars", "sprite", height=8, bpp_mode="bpp_4")
+    make_player_portraits()
+
+    # Each width shares the same tail position on screen, under the rival portrait.
+    widths = range(52, 121, 4)
+    bubble_parts = indexed((64, 64 * len(widths)), INK)
+    for frame, width in enumerate(widths):
+        bubble = indexed((128, 32), INK)
+        draw = ImageDraw.Draw(bubble)
+        tail = 160 - min(144, 234 - width)
+        draw.rounded_rectangle((0, 4, width - 1, 16), 3, fill=1, outline=3)
+        draw.line((3, 15, width - 4, 15), fill=2)
+        draw.polygon(((tail - 4, 4), (tail, 0), (tail + 4, 4)), fill=1)
+        draw.line((tail - 4, 4, tail, 0, tail + 4, 4), fill=3)
+        bubble_parts.paste(bubble.crop((0, 0, 64, 32)), (0, frame * 64))
+        bubble_parts.paste(bubble.crop((64, 0, 128, 32)), (0, frame * 64 + 32))
+    save(bubble_parts, "taunt_chip", "sprite", height=32, bpp_mode="bpp_4")
 
     # Butano's ASCII font starts at the first printable character.
     font = indexed((8, 8 * 94), INK)
@@ -578,6 +739,7 @@ if __name__ == "__main__":
     make_match_hud(compact=True)
     make_title()
     make_menu()
+    make_rival_portraits()
     make_panel()
     make_panel(paused=True)
     make_sprites()

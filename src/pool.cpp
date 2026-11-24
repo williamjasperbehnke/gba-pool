@@ -7,6 +7,8 @@ namespace pool
 namespace
 {
 constexpr int velocity_scale = 256;
+constexpr int cushion_rebound_scale = 218;
+constexpr int ball_transfer_scale = 248;
 constexpr int object_mask = 0xfefe;
 
 constexpr int abs_value(int value) { return value < 0 ? -value : value; }
@@ -204,11 +206,12 @@ void Table::rack()
     shot = {};
 }
 
-void Table::strike(Vec heading, int speed, int called_pocket, CueSpin spin)
+void Table::strike(Vec heading, int speed, int called_pocket, CueSpin spin, int spin_strength)
 {
     shot = {};
     shot.called_pocket = int8_t(called_pocket);
     shot.cue_spin = encode_spin(spin);
+    shot.spin_strength = uint8_t(spin_strength);
     balls[0].velocity = travel(heading, speed * velocity_scale);
 }
 
@@ -247,13 +250,13 @@ void Table::cushion_or_pocket(int id)
     if(hit_x)
     {
         ball.pos.x = std::clamp(ball.pos.x, left, right);
-        ball.velocity.x = -ball.velocity.x * 218 / 256;
+        ball.velocity.x = -ball.velocity.x * cushion_rebound_scale / velocity_scale;
         shot.rail_after_contact |= shot.first >= 0;
     }
     if(hit_y)
     {
         ball.pos.y = std::clamp(ball.pos.y, top, bottom);
-        ball.velocity.y = -ball.velocity.y * 218 / 256;
+        ball.velocity.y = -ball.velocity.y * cushion_rebound_scale / velocity_scale;
         shot.rail_after_contact |= shot.first >= 0;
     }
     if(id == 0 && (hit_x || hit_y) && shot.cue_spin != encode_spin({}))
@@ -261,11 +264,11 @@ void Table::cushion_or_pocket(int id)
         CueSpin spin = decode_spin(shot.cue_spin);
         if(hit_x && ! hit_y)
         {
-            ball.velocity.y += incoming.x * spin.side / 24;
+            ball.velocity.y += incoming.x * spin.side * shot.spin_strength / 2400;
         }
         if(hit_y && ! hit_x)
         {
-            ball.velocity.x -= incoming.y * spin.side / 24;
+            ball.velocity.x -= incoming.y * spin.side * shot.spin_strength / 2400;
         }
         spin.side -= (spin.side > 0) - (spin.side < 0);
         shot.cue_spin = encode_spin(spin);
@@ -310,7 +313,7 @@ void Table::collide(int a, int b)
     if(closing > 0)
     {
         impact = std::max(impact, closing / velocity_scale);
-        Vec impulse = travel(axis, closing * 248 / 256);
+        Vec impulse = travel(axis, closing * ball_transfer_scale / velocity_scale);
         Vec incoming = first.velocity;
         first.velocity = first.velocity - impulse;
         second.velocity += impulse;
@@ -322,7 +325,7 @@ void Table::collide(int a, int b)
             {
                 // Follow and draw act along the cue ball's approach after contact.
                 Vec heading = normalized({ incoming.x / velocity_scale, incoming.y / velocity_scale });
-                first.velocity += travel(heading, closing * spin.vertical / 11);
+                first.velocity += travel(heading, closing * spin.vertical * shot.spin_strength / 1100);
                 spin.vertical = 0;
                 shot.cue_spin = encode_spin(spin);
             }
@@ -585,11 +588,11 @@ Vec cushion_rebound(Vec vector, Vec contact)
 {
     if(contact.x <= left + 2 || contact.x >= right - 2)
     {
-        vector.x = -vector.x * 218 / 256;
+        vector.x = -vector.x * cushion_rebound_scale / velocity_scale;
     }
     if(contact.y <= top + 2 || contact.y >= bottom - 2)
     {
-        vector.y = -vector.y * 218 / 256;
+        vector.y = -vector.y * cushion_rebound_scale / velocity_scale;
     }
     return vector;
 }
@@ -666,10 +669,9 @@ Preview trace_aim(const Table& table, Vec heading)
     return result;
 }
 
-Preview preview_shot(const Table& table, Vec heading, int speed)
+static Preview preview_from(const Table& table, Vec cue, Vec heading, int speed)
 {
     Preview result;
-    Vec cue = table.balls[0].pos;
     int range = roll_range(heading, speed);
     result.first = table.trace(cue, heading, 0, range);
     Ray contact = result.first;
@@ -692,11 +694,16 @@ Preview preview_shot(const Table& table, Vec heading, int speed)
         Vec target = table.balls[contact.ball].pos;
         Vec object_heading = normalized(target - contact.end);
         int transfer = std::max(0, dot(heading, object_heading));
-        int object_speed = speed * transfer * 248 / (direction_unit * 256);
+        int object_speed = speed * transfer * ball_transfer_scale / (direction_unit * velocity_scale);
         result.object = table.trace(target, object_heading, contact.ball, roll_range(object_heading, object_speed));
         result.object_moves = object_speed > 5;
     }
     return result;
+}
+
+Preview preview_shot(const Table& table, Vec heading, int speed)
+{
+    return preview_from(table, table.balls[0].pos, heading, speed);
 }
 
 void EightBall::start(int breaker)
@@ -739,7 +746,12 @@ bool EightBall::requires_call() const
     return ! breaking && table.balls[8].live && legal_target(8);
 }
 
-void EightBall::finish_shot()
+bool EightBall::potted_group(Group group) const
+{
+    return table.shot.pocketed & (group == Group::open ? object_mask : group_mask(group));
+}
+
+bool EightBall::finish_shot(PotCombo* combo)
 {
     const Shot& shot = table.shot;
     Group group = groups[player];
@@ -778,7 +790,7 @@ void EightBall::finish_shot()
         outcome = ! on_eight ? Outcome::early_eight : foul ? Outcome::foul_eight :
                   made_call ? Outcome::cleared : Outcome::wrong_pocket;
         winner = outcome == Outcome::cleared ? player : 1 - player;
-        return;
+        return false;
     }
     if(sunk_eight)
     {
@@ -798,7 +810,8 @@ void EightBall::finish_shot()
     }
 
     bool continues = ! foul && (own_mask ? (shot.pocketed & own_mask) != 0 : potted);
-    if(! continues)
+    bool saved_turn = ! breaking && combo && combo->resolve(continues, foul);
+    if(! continues && ! saved_turn)
     {
         player = 1 - player;
     }
@@ -813,16 +826,7 @@ void EightBall::finish_shot()
                  groups[player] == Group::open ? Notice::open_table : Notice::turn;
     }
     breaking = false;
-}
-
-int Profile::rival_index() const
-{
-    int index = 0;
-    while(index + 1 < rival_count && best >= rivals[index + 1].unlock)
-    {
-        ++index;
-    }
-    return index;
+    return saved_turn;
 }
 
 int Profile::record(bool won, int opponent_rating)
@@ -856,11 +860,12 @@ constexpr int no_candidate = 1000000;
 constexpr Vec candidate_positions[] = { px(164, 84), px(120, 70), px(120, 101),
                                         px(52, 62), px(53, 106), px(182, 62),
                                         px(184, 107), px(88, 84) };
-int pot_candidate(const Table& table, int id, int pocket, Vec cue, int min_cut, Plan& plan)
+int pot_candidate(const Table& table, int id, int pocket, Vec cue, int min_cut, Plan& plan, int pocket_offset = 0)
 {
     Vec target = table.balls[id].pos;
     Vec object_path = pockets[pocket] - target;
-    Vec object_heading = normalized(object_path);
+    Vec centered = normalized(object_path);
+    Vec object_heading = normalized(object_path + travel({ -centered.y, centered.x }, pocket_offset));
     if(table.trace(target, object_heading, id).pocket != pocket)
     {
         return no_candidate;
@@ -880,6 +885,115 @@ int pot_candidate(const Table& table, int id, int pocket, Vec cue, int min_cut, 
     int speed = std::clamp(142 + cost * 12 / 10, 190, max_speed);
     plan = { direction_angle(cue_path), speed, cue, pocket };
     return cost + (direction_unit - cut) / 8;
+}
+
+int speed_for_range(Vec heading, int distance, int limit)
+{
+    if(roll_range(heading, limit) < distance)
+    {
+        return limit + 1;
+    }
+    int low = 0;
+    while(low < limit)
+    {
+        int candidate = (low + limit) / 2;
+        if(roll_range(heading, candidate) < distance)
+        {
+            low = candidate + 1;
+        }
+        else
+        {
+            limit = candidate;
+        }
+    }
+    return low;
+}
+
+int scratch_risk(Vec contact, Vec approach, Vec object, int cue_speed, int object_speed)
+{
+    Vec exit = travel(approach, cue_speed * unit) - travel(object, object_speed * unit);
+    Vec heading = normalized(exit);
+    int range = roll_range(heading, length(exit) / unit);
+    for(int pocket = 0; pocket < 6; ++pocket)
+    {
+        int distance = entry(pockets[pocket] - contact, heading, pocket_radius(pocket) + unit);
+        if(distance >= 0 && distance < range)
+        {
+            return 420;
+        }
+    }
+    return 0;
+}
+
+int refine_pot(const Table& table, int id, int pocket, Vec cue, int power_limit, Plan& plan, bool bank = false)
+{
+    int best_score = no_candidate;
+    int seed_angle = plan.angle;
+    Vec target = table.balls[id].pos;
+    for(int offset : { 0, -1, 1, -2, 2 })
+    {
+        int angle = (seed_angle + offset) & (angle_count - 1);
+        Vec heading = direction(angle);
+        Ray contact = table.trace(cue, heading, 0);
+        if(contact.ball != id)
+        {
+            continue;
+        }
+        Vec object = normalized(target - contact.end);
+        int cut = dot(heading, object);
+        if(cut < 240)
+        {
+            continue;
+        }
+        Ray drop = table.trace(target, object, id);
+        Vec pocket_heading = object;
+        Vec pocket_origin = target;
+        int required = 0;
+        if(bank)
+        {
+            if(! drop.rail)
+            {
+                continue;
+            }
+            pocket_origin = drop.end;
+            pocket_heading = normalized(cushion_rebound(object, drop.end));
+            Ray rebound = table.trace(pocket_origin, pocket_heading, id);
+            if(rebound.pocket != pocket)
+            {
+                continue;
+            }
+            int exit = speed_for_range(pocket_heading, length(rebound.end - pocket_origin) + 9 * unit, power_limit);
+            int before_bounce = (exit * velocity_scale + cushion_rebound_scale - 1) / cushion_rebound_scale;
+            required = length(pocket_origin - target) + roll_range(object, before_bounce);
+        }
+        else
+        {
+            if(drop.pocket != pocket)
+            {
+                continue;
+            }
+            required = length(drop.end - target) + 7 * unit;
+        }
+        int approach = length(contact.end - cue);
+        int object_speed = speed_for_range(object, required, power_limit);
+        int transfer = cut * ball_transfer_scale;
+        int impact_speed = (object_speed * direction_unit * velocity_scale + transfer - 1) / transfer;
+        int speed = speed_for_range(heading, approach + roll_range(heading, impact_speed), power_limit);
+        if(speed > power_limit)
+        {
+            continue;
+        }
+
+        int centered = abs_value(dot(pockets[pocket] - pocket_origin, { -pocket_heading.y, pocket_heading.x })) / unit;
+        int risk = scratch_risk(contact.end, heading, object, impact_speed, object_speed);
+        int score = speed + centered * 9 + (direction_unit - cut) / 12 + risk;
+        if(score < best_score)
+        {
+            plan = { angle, std::clamp(speed, min_speed, power_limit), cue, pocket };
+            best_score = score;
+        }
+    }
+    return best_score;
 }
 
 }
@@ -935,13 +1049,14 @@ bool PocketSuggestions::advance(const EightBall& game)
     return next_ball == 16;
 }
 
-void ShotPlanner::start(const EightBall& game, int difficulty)
+void ShotPlanner::start(const EightBall& game, int difficulty, int speed_limit)
 {
     *this = {};
     level = difficulty;
+    power_limit = speed_limit;
     starting_cue = game.ball_in_hand ? game.table.free_spot() : game.table.balls[0].pos;
     cue = starting_cue;
-    best = { 0, max_speed, starting_cue };
+    best = { 0, power_limit, starting_cue };
     best_score = no_candidate;
     nearest_distance = no_candidate;
     search = game.breaking ? Search::break_shot : Search::pots;
@@ -958,11 +1073,22 @@ bool ShotPlanner::advance(const EightBall& game, uint32_t& seed)
     {
         case Search::break_shot:
             best.angle = (random_below(seed, 5) - 2) & (angle_count - 1);
+            best.speed = power_limit;
             search = Search::done;
             return true;
         case Search::pots:
             find_pots(game, seed);
-            if(search == Search::pots || best_score == no_candidate)
+            if(search != Search::direct || best_score == no_candidate)
+            {
+                return false;
+            }
+            break;
+        case Search::object_banks:
+            find_object_banks(game);
+            return false;
+        case Search::verify:
+            verify_pots(game);
+            if(search != Search::done)
             {
                 return false;
             }
@@ -992,7 +1118,7 @@ void ShotPlanner::find_pots(const EightBall& game, uint32_t& seed)
 {
     const Table& table = game.table;
     // Split the search into small batches to leave time for a GBA display refresh.
-    int limit = std::min(ball_index + 3, 16);
+    int limit = std::min(ball_index + (level >= 3 ? 2 : 3), 16);
     for(; ball_index < limit; ++ball_index)
     {
         int id = ball_index;
@@ -1002,20 +1128,38 @@ void ShotPlanner::find_pots(const EightBall& game, uint32_t& seed)
         }
         for(int pocket = 0; pocket < 6; ++pocket)
         {
-            Plan plan;
-            int score = pot_candidate(table, id, pocket, cue, 350 + (4 - level) * 45, plan);
-            if(score == no_candidate)
+            constexpr int offsets[] = { 0, -3 * unit, 3 * unit };
+            int attempts = level == 4 && ! game.ball_in_hand ? 3 : 1;
+            for(int index = 0; index < attempts; ++index)
             {
-                continue;
-            }
-            if(level < 2)
-            {
-                score += random_below(seed, 40 - level * 10);
-            }
-            if(score < best_score)
-            {
-                best = plan;
-                best_score = score;
+                Plan plan;
+                int score = pot_candidate(table, id, pocket, cue, level >= 3 ? 250 : 350 + (4 - level) * 45,
+                                          plan, offsets[index]);
+                if(score == no_candidate)
+                {
+                    continue;
+                }
+                if(level >= 3)
+                {
+                    score = refine_pot(table, id, pocket, cue, power_limit, plan);
+                    if(score != no_candidate)
+                    {
+                        add_trial(plan, score);
+                        break;
+                    }
+                }
+                else
+                {
+                    if(level < 2)
+                    {
+                        score += random_below(seed, 40 - level * 10);
+                    }
+                    if(score < best_score)
+                    {
+                        best = plan;
+                        best_score = score;
+                    }
+                }
             }
         }
     }
@@ -1032,9 +1176,141 @@ void ShotPlanner::find_pots(const EightBall& game, uint32_t& seed)
                 return;
             }
         }
-        search = Search::direct;
-        cue = starting_cue;
-        ball_index = 1;
+        if(trial_count)
+        {
+            search = Search::verify;
+            return;
+        }
+        start_fallback();
+    }
+}
+
+void ShotPlanner::start_fallback()
+{
+    search = level >= 3 && ! searched_object_banks ? Search::object_banks : Search::direct;
+    cue = starting_cue;
+    ball_index = 1;
+}
+
+void ShotPlanner::add_trial(const Plan& plan, int score)
+{
+    if(trial_count == trial_capacity && score >= trial_scores[trial_count - 1])
+    {
+        return;
+    }
+    for(int index = 0; index < trial_count; ++index)
+    {
+        const Plan& existing = trials[index];
+        if(existing.angle == plan.angle && existing.placement.x == plan.placement.x &&
+           existing.placement.y == plan.placement.y)
+        {
+            return;
+        }
+    }
+    int slot = std::min(trial_count, trial_capacity - 1);
+    while(slot > 0 && trial_scores[slot - 1] > score)
+    {
+        trials[slot] = trials[slot - 1];
+        trial_scores[slot] = trial_scores[slot - 1];
+        --slot;
+    }
+    trials[slot] = plan;
+    trial_scores[slot] = score;
+    trial_count = std::min(trial_count + 1, trial_capacity);
+}
+
+void ShotPlanner::verify_pots(const EightBall& game)
+{
+    const Plan& trial = trials[trial_index];
+    if(! trial_frames)
+    {
+        trial_table = game.table;
+        trial_table.place_cue(trial.placement);
+        trial_table.strike(direction(trial.angle), trial.speed, trial.pocket);
+    }
+
+    // Preview a short batch each frame, using the same physics as the live table.
+    for(int step = 0; step < 6; ++step)
+    {
+        bool moving = trial_table.step();
+        ++trial_frames;
+        if(moving && trial_frames < 125)
+        {
+            continue;
+        }
+        int sunk = trial_table.shot.pocketed;
+        Group group = game.groups[game.player];
+        int own = group == Group::open ? object_mask : group_mask(group);
+        bool valid_pot = game.requires_call() ? trial_table.shot.eight_pocket == trial.pocket :
+                         !(sunk & (1 << 8)) && (sunk & own);
+        if(! moving && valid_pot && !(sunk & 1) && game.legal_target(trial_table.shot.first))
+        {
+            best = trial;
+            best_score = trial_scores[trial_index];
+            verified_pot = true;
+            search = Search::done;
+        }
+        else if(++trial_index == trial_count)
+        {
+            best_score = no_candidate;
+            trial_count = trial_index = 0;
+            start_fallback();
+        }
+        trial_frames = 0;
+        return;
+    }
+}
+
+void ShotPlanner::find_object_banks(const EightBall& game)
+{
+    const Table& table = game.table;
+    int id = ball_index++;
+    if(table.balls[id].live && game.legal_target(id))
+    {
+        Vec target = table.balls[id].pos;
+        for(int pocket = 0; pocket < 6; ++pocket)
+        {
+            for(int edge = 0; edge < 4; ++edge)
+            {
+                Vec reflected = pockets[pocket];
+                if(edge < 2)
+                {
+                    reflected.x = 2 * (edge == 0 ? left : right) - reflected.x;
+                }
+                else
+                {
+                    reflected.y = 2 * (edge == 2 ? top : bottom) - reflected.y;
+                }
+                Vec object = normalized(reflected - target);
+                if(! table.trace(target, object, id).rail)
+                {
+                    continue;
+                }
+                Vec path = target - travel(object, diameter) - cue;
+                if(dot(normalized(path), object) < 260 || table.trace(cue, normalized(path), 0).ball != id)
+                {
+                    continue;
+                }
+                Plan plan{ direction_angle(path), power_limit, cue, pocket };
+                int score = refine_pot(table, id, pocket, cue, power_limit, plan, true);
+                if(score != no_candidate)
+                {
+                    add_trial(plan, score);
+                }
+            }
+        }
+    }
+    if(ball_index == 16)
+    {
+        searched_object_banks = true;
+        if(trial_count)
+        {
+            search = Search::verify;
+        }
+        else
+        {
+            start_fallback();
+        }
     }
 }
 
@@ -1059,8 +1335,29 @@ void ShotPlanner::find_direct(const EightBall& game)
         }
         if(distance < best_score && table.trace(cue, direction(angle), 0).ball == id)
         {
-            best = { angle, std::min(max_speed, 255 + distance / (2 * unit)), cue };
-            best_score = distance;
+            int speed = std::min(power_limit, 255 + distance / (2 * unit));
+            if(level >= 3)
+            {
+                Preview prediction = preview_from(table, cue, direction(angle), speed);
+                if(prediction.first.ball != id || ! prediction.object_moves)
+                {
+                    continue;
+                }
+                int cue_speed = speed_at(direction(angle), speed, length(prediction.first.end - cue));
+                Vec object = normalized(table.balls[id].pos - prediction.first.end);
+                int object_speed = cue_speed * dot(direction(angle), object) * ball_transfer_scale /
+                                   (direction_unit * velocity_scale);
+                distance += scratch_risk(prediction.first.end, direction(angle), object, cue_speed, object_speed) * unit;
+                if(! prediction.object.rail && prediction.object.pocket < 0)
+                {
+                    distance += 80 * unit;
+                }
+            }
+            if(distance < best_score)
+            {
+                best = { angle, speed, cue };
+                best_score = distance;
+            }
         }
     }
     if(ball_index == 16)
@@ -1071,9 +1368,9 @@ void ShotPlanner::find_direct(const EightBall& game)
 
 void ShotPlanner::find_banks(const EightBall& game)
 {
-    constexpr int stride = 16;
+    int stride = level == 4 ? 4 : level == 3 ? 8 : 16;
     const Table& table = game.table;
-    int limit = std::min(bank_angle + 8 * stride, angle_count);
+    int limit = std::min(bank_angle + (level >= 3 ? 16 : 8) * stride, angle_count);
     for(; bank_angle < limit; bank_angle += stride)
     {
         Vec heading = direction(bank_angle);
@@ -1096,14 +1393,14 @@ void ShotPlanner::find_banks(const EightBall& game)
             int distance = length(first.end - cue) + length(rebound.end - first.end);
             if(distance < best_score)
             {
-                best = { bank_angle, max_speed, cue };
+                best = { bank_angle, power_limit, cue };
                 best_score = distance;
             }
         }
     }
     if(bank_angle == angle_count && best_score == no_candidate)
     {
-        best = { nearest_angle, max_speed, cue };
+        best = { nearest_angle, power_limit, cue };
     }
 }
 
@@ -1120,11 +1417,12 @@ void ShotPlanner::finish(const EightBall& game, uint32_t& seed)
     {
         best.pocket = -1;
     }
-    int error = rivals[level].error;
+    precise_angle = best.angle;
+    int error = verified_pot ? 0 : rivals[level].error;
     int jitter = random_below(seed, error + 1) - random_below(seed, error + 1);
     best.angle = (best.angle + jitter) & (angle_count - 1);
     best.speed = std::clamp(best.speed + random_below(seed, 5) * error - 2 * error,
-                            min_speed, max_speed);
+                            min_speed, power_limit);
     search = Search::done;
 }
 

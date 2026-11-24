@@ -16,16 +16,15 @@ namespace
 {
 constexpr int columns = 30;
 constexpr int rows = view_bottom / 8;
-// A single line visits at most one new tile for each column or row it crosses.
-// The contact preview fits within three tiles per axis.
-constexpr int tile_capacity = columns + rows + 9;
+// Budget for the incoming line, a reflected segment and the contact ring.
+constexpr int tile_capacity = 2 * (columns + rows) + 9;
 
 alignas(4) bn::tile pixels[1 + tile_capacity];
 alignas(4) bn::regular_bg_map_cell cells[32 * 32];
 int next_tile = 1;
 constexpr bn::color ink[16] = {
     { 0, 0, 0 }, { 18, 26, 22 }, { 31, 18, 15 },
-    { 12, 21, 17 }, { 17, 25, 21 }, { 17, 17, 13 }, { 27, 18, 14 }
+    { 12, 21, 17 }, { 17, 25, 21 }, { 17, 17, 13 }, { 27, 18, 14 }, { 30, 23, 12 }
 };
 
 constexpr int ghost_extent = (ghost_ball_radius + unit / 2) / unit;

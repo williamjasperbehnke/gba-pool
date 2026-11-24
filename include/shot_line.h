@@ -7,7 +7,7 @@
 
 namespace pool
 {
-enum class LineInk { cue = 1, warning };
+enum class LineInk { cue = 1, warning, bank = 7 };
 constexpr int ghost_ball_radius = 4 * unit;
 
 class ShotLine

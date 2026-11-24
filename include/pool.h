@@ -65,12 +65,21 @@ struct Ball
 struct Shot
 {
     uint16_t pocketed = 0;
+    uint8_t spin_strength = 100;
     int first = -1;
     int first_pot = -1;
     bool rail_after_contact = false;
     int8_t eight_pocket = -1;
     int8_t called_pocket = -1;
     uint8_t cue_spin = encode_spin({});
+
+    constexpr Shot() = default;
+    constexpr Shot(uint16_t potted, int first_hit, int first_ball_potted, bool reached_rail,
+                   int8_t eight = -1, int8_t called = -1, uint8_t spin = encode_spin({})) :
+        pocketed(potted), first(first_hit), first_pot(first_ball_potted), rail_after_contact(reached_rail),
+        eight_pocket(eight), called_pocket(called), cue_spin(spin)
+    {
+    }
 };
 
 struct Ray
@@ -89,7 +98,7 @@ public:
     int impact = 0;
 
     void rack();
-    void strike(Vec heading, int speed, int called_pocket = -1, CueSpin spin = {});
+    void strike(Vec heading, int speed, int called_pocket = -1, CueSpin spin = {}, int spin_strength = 100);
     bool step();
     bool can_place(Vec pos, int ignore = 0) const;
     void place_cue(Vec pos);
@@ -122,6 +131,34 @@ enum class Notice { break_shot, turn, open_table, pot, scratch, no_contact, wron
                     no_rail, spotted };
 enum class Outcome { playing, cleared, early_eight, foul_eight, wrong_pocket };
 
+class PotCombo
+{
+public:
+    void arm() { state = State::waiting; }
+    bool active() const { return state != State::inactive; }
+    bool ready() const { return state == State::ready; }
+
+    bool resolve(bool scored, bool foul)
+    {
+        if(! active())
+        {
+            return false;
+        }
+        if(scored)
+        {
+            state = State::ready;
+            return false;
+        }
+        bool saved_turn = ! foul && ready();
+        state = State::inactive;
+        return saved_turn;
+    }
+
+private:
+    enum class State { inactive, waiting, ready };
+    State state = State::inactive;
+};
+
 class EightBall
 {
 public:
@@ -135,27 +172,28 @@ public:
     Outcome outcome = Outcome::playing;
 
     void start(int breaker);
-    void finish_shot();
+    bool finish_shot(PotCombo* combo = nullptr);
     bool legal_target(int ball) const;
     bool requires_call() const;
+    bool potted_group(Group group) const;
     int remaining(Group group) const;
 };
 
 struct Rival
 {
     const char* name;
+    const char* short_name;
     const char* rank;
-    int unlock;
     int rating;
     int error;
 };
 
 inline constexpr Rival rivals[] = {
-    { "LOU", "ROOKIE", 850, 850, 15 },
-    { "IZZY", "REGULAR", 900, 950, 9 },
-    { "JULES", "CLUB PRO", 975, 1050, 5 },
-    { "NIKO", "SHARK", 1060, 1150, 3 },
-    { "VERA", "ACE", 1160, 1300, 1 }
+    { "PIP THE OTTER", "PIP", "ROOKIE", 850, 18 },
+    { "NORI THE PENGUIN", "NORI", "REGULAR", 925, 12 },
+    { "EMBER THE FOX", "EMBER", "CLUB PRO", 1010, 7 },
+    { "INK THE OCTOPUS", "INK", "EXPERT", 1100, 1 },
+    { "FINN THE SHARK", "FINN", "ACE", 1210, 0 }
 };
 inline constexpr int rival_count = sizeof(rivals) / sizeof(rivals[0]);
 
@@ -166,7 +204,6 @@ struct Profile
     int wins = 0;
     int losses = 0;
 
-    int rival_index() const;
     int record(bool won, int opponent_rating);
 };
 
@@ -198,25 +235,43 @@ private:
 class ShotPlanner
 {
 public:
-    void start(const EightBall& game, int difficulty);
+    void start(const EightBall& game, int difficulty, int speed_limit = max_speed);
     bool advance(const EightBall& game, uint32_t& seed);
     const Plan& result() const { return best; }
+    int planned_angle() const { return precise_angle; }
+    bool has_verified_pot() const { return verified_pot; }
 
 private:
-    enum class Search { break_shot, pots, direct, banks, done };
+    enum class Search { break_shot, pots, object_banks, verify, direct, banks, done };
     Search search = Search::done;
     int level = 0;
+    int power_limit = max_speed;
     int position_index = 0;
     int ball_index = 1;
     int bank_angle = 0;
     int nearest_distance = 0;
     int nearest_angle = 0;
     int best_score = 0;
+    int precise_angle = 0;
     Vec starting_cue;
     Vec cue;
     Plan best;
+    static constexpr int trial_capacity = 3;
+    Plan trials[trial_capacity];
+    int trial_scores[trial_capacity];
+    int trial_count = 0;
+    int trial_index = 0;
+    int trial_frames = 0;
+    bool searched_object_banks = false;
+    bool verified_pot = false;
+    Table trial_table;
+
 
     void find_pots(const EightBall& game, uint32_t& seed);
+    void add_trial(const Plan& plan, int score);
+    void verify_pots(const EightBall& game);
+    void find_object_banks(const EightBall& game);
+    void start_fallback();
     void find_direct(const EightBall& game);
     void find_banks(const EightBall& game);
     void finish(const EightBall& game, uint32_t& seed);

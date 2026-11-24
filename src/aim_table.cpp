@@ -40,7 +40,7 @@ constexpr bn::color colors[16] = {
     { 0, 0, 0 }, { 10, 6, 5 }, { 16, 9, 6 }, { 22, 14, 9 },
     { 24, 16, 10 }, { 13, 7, 5 }, { 7, 16, 12 }, { 9, 20, 14 },
     { 9, 7, 7 }, { 2, 3, 5 }, { 12, 8, 6 }, { 20, 11, 7 },
-    { 26, 21, 14 }, { 19, 12, 8 }, { 7, 17, 13 }, { 6, 4, 5 }
+    { 31, 23, 8 }, { 19, 12, 8 }, { 7, 17, 13 }, { 6, 4, 5 }
 };
 
 struct Vertex
@@ -415,7 +415,7 @@ void mark_pocket_rows(const Vec* points, int count)
 }
 
 template<int Mouth, int Floor>
-void pocket_well(const AimCamera& camera, const Vertex (&mouth)[Mouth], const Vertex (&floor)[Floor])
+void pocket_well(const AimCamera& camera, const Vertex (&mouth)[Mouth], const Vertex (&floor)[Floor], bool called)
 {
     Vec projected_mouth[Mouth + 1];
     ScanEdges opening;
@@ -440,6 +440,18 @@ void pocket_well(const AimCamera& camera, const Vertex (&mouth)[Mouth], const Ve
         if(visible && y >= well.top && y < well.bottom)
         {
             span(std::max(left, well.left(y)), std::min(right, well.right(y)), y, 0x99999999);
+        }
+        if(called && right > left)
+        {
+            if(y == opening.top || y == opening.bottom - 1)
+            {
+                span(left, right, y, 0xcccccccc);
+            }
+            else
+            {
+                span(left, left + 1, y, 0xcccccccc);
+                span(right - 1, right, y, 0xcccccccc);
+            }
         }
     }
 }
@@ -470,24 +482,30 @@ constexpr auto felt_marks()
         Vec points[60];
     };
     Marks marks{};
-    for(int row = 0; row < 6; ++row)
+    uint32_t seed = 0x89ac8301;
+    int used = 0;
+    for(int sample = 0; sample < 360 && used < 60; ++sample)
     {
-        for(int column = 0; column < 10; ++column)
+        seed = seed * 1664525u + 1013904223u;
+        int x = 20 + int((seed >> 16) % 200);
+        seed = seed * 1664525u + 1013904223u;
+        int y = 45 + int((seed >> 16) % 78);
+        bool clear = true;
+        for(Vec pocket : pockets)
         {
-            // Jitter a world-space grid to avoid a regular pattern on the cloth.
-            int x = 20 + column * 20 + (column * 7 + row * 13) % 13;
-            int y = 46 + row * 13 + (column * 11 + row * 5) % 9;
-            for(Vec pocket : pockets)
-            {
-                int dx = x - pocket.x / unit;
-                int dy = y - pocket.y / unit;
-                if(dx * dx + dy * dy < 17 * 17)
-                {
-                    x = 0;
-                    break;
-                }
-            }
-            marks.points[row * 10 + column] = px(x, y);
+            int dx = x - pocket.x / unit;
+            int dy = y - pocket.y / unit;
+            clear &= dx * dx + dy * dy >= 17 * 17;
+        }
+        for(int index = 0; index < used && clear; ++index)
+        {
+            int dx = x - marks.points[index].x / unit;
+            int dy = y - marks.points[index].y / unit;
+            clear = dx * dx + dy * dy >= 9 * 9;
+        }
+        if(clear)
+        {
+            marks.points[used++] = px(x, y);
         }
     }
     return marks;
@@ -519,25 +537,13 @@ BN_CODE_IWRAM void felt_texture(const AimCamera& camera)
     }
 }
 
-void rail_sight(const AimCamera& camera, int x, int y, int across_x, int across_y)
-{
-    if(camera.local(px(x, y), rail_top * unit).depth > 105 * unit)
-    {
-        return;
-    }
-    int along_x = across_y * 2;
-    int along_y = across_x * 2;
-    face(camera, {{ x - along_x, y - along_y, rail_top }, { x - across_x, y - across_y, rail_top },
-                   { x + along_x, y + along_y, rail_top }, { x + across_x, y + across_y, rail_top }}, 12);
-}
-
 void long_rail(const AimCamera& camera, int edge, int inward)
 {
     int back = edge + inward * 3;
     int inner = edge + inward * 8;
     int nose = edge + inward * 11;
-    quad(camera, end_left, std::min(edge, back), side_lip_x[0], std::max(edge, back), rail_top, 4);
-    quad(camera, side_lip_x[3], std::min(edge, back), end_right, std::max(edge, back), rail_top, 4);
+    quad(camera, end_left, std::min(edge, back), side_lip_x[0], std::max(edge, back), rail_top, 3);
+    quad(camera, side_lip_x[3], std::min(edge, back), end_right, std::max(edge, back), rail_top, 3);
     for(int index = 0; index < 3; ++index)
     {
         int x0 = side_lip_x[index];
@@ -545,12 +551,13 @@ void long_rail(const AimCamera& camera, int edge, int inward)
         int y0 = edge + inward * side_lip_y[index];
         int y1 = edge + inward * side_lip_y[index + 1];
         face(camera, {{ x0, edge, rail_top }, { x1, edge, rail_top },
-                       { x1, y1, rail_top }, { x0, y0, rail_top }}, 4);
+                       { x1, y1, rail_top }, { x0, y0, rail_top }}, 3);
     }
 
-    face(camera, {{ 20, back, rail_top }, { 114, back, rail_top },
+    // The boards overlap beneath their coplanar join so the apron cannot show through it.
+    face(camera, {{ 20, back - inward, rail_top }, { 114, back - inward, rail_top },
                    { 112, inner, rail_top }, { 25, inner, rail_top }}, 3);
-    face(camera, {{ 126, back, rail_top }, { 220, back, rail_top },
+    face(camera, {{ 126, back - inward, rail_top }, { 220, back - inward, rail_top },
                    { 215, inner, rail_top }, { 128, inner, rail_top }}, 3);
     int cushion = inward > 0 ? 7 : 6;
     face(camera, {{ 25, inner, rail_top }, { 112, inner, rail_top }, { 108, nose, 0 }, { 29, nose, 0 }},
@@ -558,13 +565,6 @@ void long_rail(const AimCamera& camera, int edge, int inward)
     face(camera, {{ 128, inner, rail_top }, { 215, inner, rail_top }, { 211, nose, 0 }, { 132, nose, 0 }},
          cushion);
 
-    for(int first : { 26, 130 })
-    {
-        for(int x = first + 15; x < first + 74; x += 26)
-        {
-            rail_sight(camera, x, back + inward * 2, 0, 1);
-        }
-    }
 }
 
 void short_rail(const AimCamera& camera, int edge, int inward)
@@ -572,15 +572,11 @@ void short_rail(const AimCamera& camera, int edge, int inward)
     int back = edge + inward * 5;
     int inner = edge + inward * 8;
     int nose = edge + inward * 11;
-    quad(camera, std::min(edge, back), 32, std::max(edge, back), 136, rail_top, 4);
-    face(camera, {{ back, 47, rail_top }, { inner, 50, rail_top },
-                   { inner, 118, rail_top }, { back, 121, rail_top }}, 3);
+    quad(camera, std::min(edge, back), 32, std::max(edge, back), 136, rail_top, 3);
+    face(camera, {{ back - inward, 47, rail_top }, { inner, 50, rail_top },
+                   { inner, 118, rail_top }, { back - inward, 121, rail_top }}, 3);
     face(camera, {{ inner, 50, rail_top }, { nose, 54, 0 }, { nose, 114, 0 }, { inner, 118, rail_top }}, 6);
 
-    for(int y : { 62, 84, 106 })
-    {
-        rail_sight(camera, back + inward, y, 1, 0);
-    }
 }
 
 bool pocket_may_be_visible(const AimCamera& camera, Vec center)
@@ -593,7 +589,7 @@ bool pocket_may_be_visible(const AimCamera& camera, Vec center)
     return point.depth >= near_depth && ! camera.outside_sides(point);
 }
 
-void side_pocket(const AimCamera& camera, int edge, int inward)
+void side_pocket(const AimCamera& camera, int edge, int inward, bool called)
 {
     if(! pocket_may_be_visible(camera, px(120, edge + inward * 10)))
     {
@@ -609,7 +605,7 @@ void side_pocket(const AimCamera& camera, int edge, int inward)
                          { 129, curve, 0 }, { 125, mouth, 0 }, { 115, mouth, 0 }, { 111, curve, 0 },
                          { 108, nose, 0 }, { 108, heel, 0 }},
                         {{ 114, back, -4 }, { 126, back, -4 }, { 131, heel, -4 }, { 131, nose, -4 },
-                         { 127, curve, -4 }, { 113, curve, -4 }, { 109, nose, -4 }, { 109, heel, -4 }});
+                         { 127, curve, -4 }, { 113, curve, -4 }, { 109, nose, -4 }, { 109, heel, -4 }}, called);
 
     // Follow the curved cutout in the wood down into the leather backing.
     for(int index = 0; index < 3; ++index)
@@ -619,17 +615,17 @@ void side_pocket(const AimCamera& camera, int edge, int inward)
         int y0 = edge + inward * side_lip_y[index];
         int y1 = edge + inward * side_lip_y[index + 1];
         face(camera, {{ x0, y0, rail_top }, { x1, y1, rail_top },
-                       { x1, y1 + inward * 4, 0 }, { x0, y0 + inward * 4, 0 }}, 8);
+                       { x1, y1 + inward * 4, 0 }, { x0, y0 + inward * 4, 0 }}, called ? 12 : 8);
     }
 
     // Leather covers the cut ends of the cushions inside the mouth.
-    face(camera, {{ 113, back, rail_top }, { 112, inner, rail_top }, { 108, nose, 0 }}, 8);
-    face(camera, {{ 113, back, rail_top }, { 108, nose, 0 }, { 113, back + inward * 4, 0 }}, 8);
-    face(camera, {{ 127, back, rail_top }, { 128, inner, rail_top }, { 132, nose, 0 }}, 8);
-    face(camera, {{ 127, back, rail_top }, { 132, nose, 0 }, { 127, back + inward * 4, 0 }}, 8);
+    face(camera, {{ 113, back, rail_top }, { 112, inner, rail_top }, { 108, nose, 0 }}, called ? 12 : 8);
+    face(camera, {{ 113, back, rail_top }, { 108, nose, 0 }, { 113, back + inward * 4, 0 }}, called ? 12 : 8);
+    face(camera, {{ 127, back, rail_top }, { 128, inner, rail_top }, { 132, nose, 0 }}, called ? 12 : 8);
+    face(camera, {{ 127, back, rail_top }, { 132, nose, 0 }, { 127, back + inward * 4, 0 }}, called ? 12 : 8);
 }
 
-void corner_pocket(const AimCamera& camera, int x, int y)
+void corner_pocket(const AimCamera& camera, int x, int y, bool called)
 {
     int dx = x == end_left ? 1 : -1;
     int dy = y == 32 ? 1 : -1;
@@ -641,25 +637,25 @@ void corner_pocket(const AimCamera& camera, int x, int y)
     pocket_well(camera, { point(5, 3, 0), point(14, 3, 0), point(23, 11, 0), point(20, 15, 0),
                           point(17, 18, 0), point(13, 21, 0), point(9, 22, 0), point(5, 17, 0) },
                          { point(6, 4, -4), point(14, 4, -4), point(20, 11, -4), point(19, 14, -4),
-                           point(16, 17, -4), point(12, 19, -4), point(9, 19, -4), point(6, 16, -4) });
+                           point(16, 17, -4), point(12, 19, -4), point(9, 19, -4), point(6, 16, -4) }, called);
 
     // The rounded collar joins the two wood rails around the back of the drop.
     constexpr int lip[][2] = { { 14, 3 }, { 10, 3 }, { 7, 4 }, { 5, 7 }, { 5, 15 } };
     face(camera, { point(5, 3, rail_top), point(10, 3, rail_top),
-                   point(7, 4, rail_top), point(5, 7, rail_top) }, 8);
+                   point(7, 4, rail_top), point(5, 7, rail_top) }, called ? 12 : 8);
     for(int index = 0; index < 4; ++index)
     {
         Vertex a = point(lip[index][0], lip[index][1], rail_top);
         Vertex b = point(lip[index + 1][0], lip[index + 1][1], rail_top);
         Vertex c = point(lip[index + 1][0] + 2, lip[index + 1][1] + 2, 0);
         Vertex d = point(lip[index][0] + 2, lip[index][1] + 2, 0);
-        face(camera, { a, b, c, d }, 8);
+        face(camera, { a, b, c, d }, called ? 12 : 8);
     }
 
-    face(camera, { point(14, 3, rail_top), point(19, 8, rail_top), point(23, 11, 0) }, 8);
-    face(camera, { point(14, 3, rail_top), point(23, 11, 0), point(16, 5, 0) }, 8);
-    face(camera, { point(5, 15, rail_top), point(8, 18, rail_top), point(11, 22, 0) }, 8);
-    face(camera, { point(5, 15, rail_top), point(11, 22, 0), point(7, 17, 0) }, 8);
+    face(camera, { point(14, 3, rail_top), point(19, 8, rail_top), point(23, 11, 0) }, called ? 12 : 8);
+    face(camera, { point(14, 3, rail_top), point(23, 11, 0), point(16, 5, 0) }, called ? 12 : 8);
+    face(camera, { point(5, 15, rail_top), point(8, 18, rail_top), point(11, 22, 0) }, called ? 12 : 8);
+    face(camera, { point(5, 15, rail_top), point(11, 22, 0), point(7, 17, 0) }, called ? 12 : 8);
 }
 
 }
@@ -704,18 +700,18 @@ void AimTable::commit()
     background->set_visible(true);
 }
 
-void AimTable::draw(const AimCamera& camera)
+void AimTable::draw(const AimCamera& camera, int called_pocket)
 {
     bn::memory::clear(pixels);
     bn::memory::clear(pocket_rows);
     quad(camera, end_left, 32, end_right, 136, 0, 14);
     felt_texture(camera);
-    side_pocket(camera, 32, 1);
-    side_pocket(camera, 136, -1);
-    corner_pocket(camera, end_left, 32);
-    corner_pocket(camera, end_right, 32);
-    corner_pocket(camera, end_left, 136);
-    corner_pocket(camera, end_right, 136);
+    side_pocket(camera, 32, 1, called_pocket == 1);
+    side_pocket(camera, 136, -1, called_pocket == 4);
+    corner_pocket(camera, end_left, 32, called_pocket == 0);
+    corner_pocket(camera, end_right, 32, called_pocket == 2);
+    corner_pocket(camera, end_left, 136, called_pocket == 3);
+    corner_pocket(camera, end_right, 136, called_pocket == 5);
 
     Vec eye = camera.position();
     // On the far sides, the short upper walls fill the seam below the raised rails.
